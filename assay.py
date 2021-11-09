@@ -61,15 +61,15 @@ class PoelwijkData(Assay):
 
         # ===== featurize sequences as higher-order interactions =====
         df = self.read_poelwijk_supp3()
-        Xsigned_nxp = self.strarr2signedarr(df.binary_genotype)  # 1/-1 encoding of sequences
-        self.X_nxp = util.walsh_hadamard_from_seqs(Xsigned_nxp, order=order)[:, 1 :] # featurize
+        self.Xsigned_nxp = self.strarr2signedarr(df.binary_genotype)  # 1/-1 encoding of sequences
+        self.X_nxp = util.walsh_hadamard_from_seqs(self.Xsigned_nxp, order=order) # featurize
 
         # ESM-1v masked marginal as feature
         # d = np.load('../poelwijk/esm_mm.npz')
         # feat_n = np.mean(d['score_nx5'], axis=1)
         # self.X_nxp = np.hstack([self.X_nxp, feat_n[:, None]])
 
-        if append_distance:
+        if append_distance:  # this is a linear combination of existing features...
             # distance from WT as feature
             feat_n = np.sum((self.X_nxp[:, 1 : 14] + 1) / 2, axis=1)
             if fitness == 'red':
@@ -128,6 +128,9 @@ class PoelwijkData(Assay):
         # Fowler et al. estimate of SE
         # se_n = np.sqrt((1/(df.counts_input+0.5)) + (1/(df.counts_input[0]+0.5))+ (1/(counts_n+0.5)) + (1/(counts_n[0]+0.5)))
 
+
+    def find(self, Xsigned_nxp):
+        return np.array([np.where((self.Xsigned_nxp == X_p).all(axis=1))[0][0] for X_p in Xsigned_nxp])
 
     def read_poelwijk_supp3(self):
         supp3_df = pd.read_excel(
