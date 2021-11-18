@@ -1,249 +1,411 @@
-from abc import ABC, abstractmethod
-import time
-
 import numpy as np
+import time
 import scipy as sc
 
-import util
-from assay import Assay
+from sklearn.linear_model import Ridge
 
-from sklearn.linear_model import Ridge, RidgeCV
+def get_wt_centered_train_data(wt_is_1, n_sample, p_mutate, seed: int = None):
+    np.random.seed(seed)
+    X_nxp = sc.stats.bernoulli.rvs(1 - p_mutate if wt_is_1 else p_mutate, size=(n_sample, 13))
+    X_nxp[X_nxp == 0] = -1
+
+    def ptrain_fn(Xtest_nxp):
+        nzero_n = np.sum(Xtest_nxp[:, 1 : 14] < 0, axis=1)
+        none_n = 13 - nzero_n
+        pmut_n = np.power(p_mutate, nzero_n if wt_is_1 else none_n)
+        pwt_n = np.power(1 - p_mutate, none_n if wt_is_1 else nzero_n)
+        return pmut_n * pwt_n
+
+    return X_nxp, ptrain_fn
+
+def get_lrs(Xaug_nxp, yaug_n, ptrain_fn, Xuniv_nxp, lmbda, model):
+    """
+    Returns n + 1 likelihood ratios w(x_i; z_{-i}) for i = 1, ..., n + 1
+    :param Xaug_nxp: numpy array of n + 1 covariates (training + test)
+    :param yaug_n: numpy array of n + 1 labels (training + test)
+    :param ptrain_fn: fn returning likelihood of covariate under training distribution
+    :param model: fit() and predict() methods
+    :return: numpy array l x (n + 1) likelihood ratios where l is number of lambda values
+    """
+
+    # compute weights for each value of lambda, the inverse temperature
+    w_n1 = np.zeros([yaug_n.size])
+    for i in range(yaug_n.size):
+
+        # fit LOO model
+        Xtr_nxp = np.vstack([Xaug_nxp[: i], Xaug_nxp[i + 1 :]])
+        ytr_n = np.hstack([yaug_n[: i], yaug_n[i + 1 :]])
+        model.fit(Xtr_nxp, ytr_n)
+
+        # -----compute w(x_i; z_{-i})-----
+        # compute normalizing constant
+        predall_n = model.predict(Xuniv_nxp)
+        Z = np.sum(np.exp(lmbda * predall_n))
+
+        testpred = model.predict(Xaug_nxp[i][None, :])
+        ptest = np.exp(lmbda * testpred) / Z
+        w_n1[i] = ptest / ptrain_fn(Xaug_nxp[i][None, :])
+
+    return w_n1
 
 
-class FitnessModel(ABC):
-    def __init__(self):
-        pass
+def weighted_quantile(vals_n, weights_n, quantile, tol: float = 1e-12):
+    if np.abs(np.sum(weights_n) - 1) > tol:
+        raise ValueError("weights don't sum to one.")
 
-    @abstractmethod
-    def fit(self, X_nxp, y_n, **kwargs):
-        pass
+    # sort values
+    sorter = np.argsort(vals_n)
+    vals_n = vals_n[sorter]
+    weights_n = weights_n[sorter]
 
-    @abstractmethod
-    def get_next_sequences(self, X_nxp, k: int):
-        pass
+    cumweight_n = np.cumsum(weights_n)
+    idx = np.searchsorted(cumweight_n, quantile, side='left')
+    # idx = np.min(np.where(cumweight_n >= quantile)[0])
+    return vals_n[idx]
 
-    @abstractmethod
-    def get_uncertainty(self, X_nxp, idx):
-        pass
 
-class TopKRidgeRegression(FitnessModel):
-    def __init__(self, fit_intercept: bool = True, reg = 1e-6, regs = None):
-        if regs is not None:
-            self.model = RidgeCV(fit_intercept=fit_intercept, alphas=regs)
+def get_quantile(alpha, w_n1xy, scores_n1xy):
+    """
+    Returns weighted 1 - alpha quantile of n + 1 scores, given likelihood ratios w(x_i; z_{-i}) and scores
+    :param alpha: float, miscoverage level
+    :param w_n1: numpy array, n + 1 likelihood ratios, assuming the last one is w(x_{n + 1}; z_{1:n})
+    :param scores_n1: numpy array, n + 1 scores
+    :return: float
+    """
+    if w_n1xy.ndim == 1:
+        w_n1xy = w_n1xy[:, None]
+        scores_n1xy = scores_n1xy[:, None]
+    p_n1xy = w_n1xy / np.sum(w_n1xy, axis=0)
+    augscore_n1xy = np.vstack([scores_n1xy[: -1], np.inf * np.ones([scores_n1xy.shape[1]])])
+    q_y = np.array([weighted_quantile(augscore_n1, p_n1, 1 - alpha) for augscore_n1, p_n1 in zip(augscore_n1xy.T, p_n1xy.T)])
+    return q_y
+
+
+def is_covered(y, cs, tol):
+    return np.any(np.abs(y - cs) < tol)
+
+def get_scores(model, Xaug_nxp, yaug_n, use_loo_score: bool = False):
+    if use_loo_score:
+        scores_n1 = np.zeros([yaug_n.size])
+        pred_n1 = np.zeros([yaug_n.size])
+        for i in range(yaug_n.size):
+            Xtr_nxp = np.vstack([Xaug_nxp[: i], Xaug_nxp[i + 1 :]])
+            ytr_n = np.hstack([yaug_n[: i], yaug_n[i + 1 :]])
+            model.fit(Xtr_nxp, ytr_n)
+            pred_1 = model.predict(Xaug_nxp[i][None, :])
+            scores_n1[i] = np.abs(yaug_n[i] - pred_1[0])
+            pred_n1[i] = pred_1[0]
+    else:
+        model.fit(Xaug_nxp, yaug_n)
+        pred_n1 = model.predict(Xaug_nxp)
+        scores_n1 = np.abs(yaug_n - pred_n1)
+    return scores_n1, pred_n1
+
+def get_ridge_insample_scores(Xaug_n1xp, ytrain_n, ys, gamma, use_lapack_inversion: bool = True):
+    p = Xaug_n1xp.shape[1]
+    n = ytrain_n.size
+    cov_pxp = Xaug_n1xp.T.dot(Xaug_n1xp) + gamma * np.eye(p)
+    if use_lapack_inversion:
+        # fastest way to invert PD matrices, but no robust error-checking
+        # https://stackoverflow.com/questions/40703042/more-efficient-way-to-invert-a-matrix-knowing-it-is-symmetric-and-positive-semi
+        zz, _ = sc.linalg.lapack.dpotrf(cov_pxp, False, False)
+        invcovtri_pxp, info = sc.linalg.lapack.dpotri(zz)
+        assert(info == 0)
+        invcov_pxp = np.triu(invcovtri_pxp) + np.triu(invcovtri_pxp, k=1).T
+    else:
+        invcov_pxp = sc.linalg.pinvh(cov_pxp)
+    A = invcov_pxp.dot(Xaug_n1xp.T)  # p x (n + 1)
+    C = A[:, : -1].dot(ytrain_n)  # p elements
+
+    a_n1 = C.dot(Xaug_n1xp.T)
+    b_n1 = A[:, -1].dot(Xaug_n1xp.T)
+
+    # process in-sample scores for each candidate value y
+    scoresis_n1xy = np.zeros([n + 1, ys.size])
+    by_n1xy = np.outer(b_n1, ys)
+    muhatiy_n1xy = a_n1[:, None] + by_n1xy
+    scoresis_n1xy[: -1] = np.abs(ytrain_n[:, None] - muhatiy_n1xy[: -1])
+    scoresis_n1xy[-1] = np.abs(ys - muhatiy_n1xy[-1])
+    return scoresis_n1xy
+
+def get_ridge_loo_scores(Xaug_n1xp, ytrain_n, ys, gamma, use_lapack_inversion: bool = True):
+    p = Xaug_n1xp.shape[1]
+    n = ytrain_n.size
+
+    # for LOO score, train n + 1 LOO models and store linear parameterizations of \mu_{-i, y}(X_i) as function of y
+    ab_nx2 = np.zeros([n, 2])
+    C_nxp = np.zeros([n, p])
+    An_nxp = np.zeros([n, p])
+    for i in range(n):
+        # construct A_{-i}
+        Xi_nxp = np.vstack([Xaug_n1xp[: i], Xaug_n1xp[i + 1 :]]) # n rows
+        cov_pxp = Xi_nxp.T.dot(Xi_nxp) + gamma * np.eye(p)
+
+        # invert covariance matrix
+        if use_lapack_inversion:
+            zz, _ = sc.linalg.lapack.dpotrf(cov_pxp, False, False)
+            invcovtri_pxp, info = sc.linalg.lapack.dpotri(zz)
+            assert(info == 0)
+            invcov_pxp = np.triu(invcovtri_pxp) + np.triu(invcovtri_pxp, k=1).T
         else:
-            self.model = Ridge(fit_intercept=fit_intercept, alpha=reg)
-        self.fit_intercept = fit_intercept
-        # self.reg = reg
+            invcov_pxp = sc.linalg.pinvh(cov_pxp)
+        Ai = invcov_pxp.dot(Xi_nxp.T)  # p x n
 
-    def fit(self, X_nxp, y_n, **kwargs):
-        self.model.fit(X_nxp, y_n, **kwargs)
-        self.reg = self.model.alpha_
+        # compute linear parameterizations of \mu_{-i, y}(X_i)
+        yi_ = np.hstack([ytrain_n[: i], ytrain_n[i + 1 :]])  # n - 1 elements
+        Ci = Ai[:, : -1].dot(yi_) # p elements
+        ai = Ci.dot(Xaug_n1xp[i])  # = Xtrain_nxp[i]
+        bi = Ai[:, -1].dot(Xaug_n1xp[i])
 
-    def predict(self, X_nxp):
-        return self.model.predict(X_nxp)
+        # store
+        ab_nx2[i] = ai, bi
+        C_nxp[i] = Ci
+        An_nxp[i] = Ai[:, -1]
 
-    def get_next_sequences(self, X_nxp, k: int, exclude_idx = None):
-        if exclude_idx is None:
-            exclude_idx = []
-        pred_n = self.model.predict(X_nxp)
-        best_idx = np.argsort(pred_n)[::-1]
-        # ignore samples already observed before
-        delete_idx = [np.where(best_idx == i)[0] for i in exclude_idx]
-        idx = np.delete(best_idx, delete_idx)
-        return idx[: k]
+    # LOO score for i = n + 1
+    model = Ridge(alpha=gamma, fit_intercept=False)
+    model.fit(Xaug_n1xp[: -1], ytrain_n) # = Xtrain_nxp
+    alast = model.predict(Xaug_n1xp[-1][None, :])  # a_{n + 1}. Xaug_n1xp[-1] = Xtest_p
 
-    def get_uncertainty(self, X_nxp, newidx_k, oldidx, uncertainty_type: str = 'inverse_prediction'):
-        if uncertainty_type == "confidence_ellipsoid":
-            if self.fit_intercept:
-                X_nxp = np.hstack([np.ones((X_nxp.shape[0], 1)), X_nxp])
-            xa_kxp = X_nxp[newidx_k]
-            V_pxp = X_nxp[oldidx].T.dot(X_nxp[oldidx]) + self.reg * np.eye(X_nxp.shape[1])
-            Vinv_pxp = np.linalg.inv(V_pxp)
-            return np.array([np.sqrt(xa_p.dot(Vinv_pxp.dot(xa_p))) for xa_p in xa_kxp])
-        elif uncertainty_type == 'inverse_prediction':
-            return 1. / np.exp(self.model.predict(X_nxp[newidx_k]))
-        return np.ones([newidx_k.size])
+    # process LOO scores for each candidate value y
+    scoresloo_n1xy = np.zeros([n + 1, ys.size])
+    by_nxy = np.outer(ab_nx2[:, 1], ys)
+    prediy_nxy = ab_nx2[:, 0][:, None] + by_nxy
+    scoresloo_n1xy[: -1] = np.abs(ytrain_n[:, None] - prediy_nxy)
+    scoresloo_n1xy[-1] = np.abs(ys - alast)
+    return scoresloo_n1xy, prediy_nxy, alast, An_nxp, C_nxp
 
-def qhatplus(vals_kxn, alpha):
-    k, n = vals_kxn.shape
-    if alpha < 1 / (n + 1):
-        return np.inf * np.ones([k])
-    idx = int(np.ceil((1 - alpha) * (n + 1)))
-    return np.sort(vals_kxn, axis=1)[:, idx - 1]
+def get_ridge_covint_weights(Xtrain_nxp, ytrain_n, Xtest_1xp, gamma, prediy_nxy, lmbda, C_nxp, An_nxp, ys, Xuniv_uxp, ptrain_fn):
+    # process likelihood ratios for each candidate value y
+    n = ytrain_n.size
+    wi_num_nxy = np.exp(lmbda * prediy_nxy)
+    betaiy_nxpxy = C_nxp[:, :, None] + ys * An_nxp[:, :, None]
+    pred_nxyxu = np.tensordot(betaiy_nxpxy, Xuniv_uxp, axes=(1, 1))
+    normconst_nxy = np.sum(np.exp(lmbda * pred_nxyxu), axis=2)
+    ptrain_n = ptrain_fn(Xtrain_nxp)
 
-def qhatminus(vals_kxn, alpha):
-    idx = int(np.floor(alpha * (vals_kxn.shape[1] + 1)))
-    return np.sort(vals_kxn, axis=1)[:, idx - 1]
+    w_n1xy = np.zeros([n + 1, ys.size])
+    w_n1xy[: -1] = wi_num_nxy / (ptrain_n[:, None] * normconst_nxy)
 
-def jackknife(model, alpha: float, X_nxp, arms_sxtxk, reward_sxtxk, pred_sxtxk, u_sxtxk,
-              uncertainty_type: str = "inverse_prediction", print_every: int = 10):
-    n_seed, tmp, k = reward_sxtxk.shape
-    n_round = tmp - 1
-    score_sxt = np.zeros([n_seed, n_round + 1])
-    jkpluscov_sxtxk = np.zeros([n_seed, n_round + 1, k])
-    jkcov_sxtxk = np.zeros([n_seed, n_round + 1, k])
-    jklen_sxtxk = np.zeros([n_seed, n_round +1, k])
-    jkplen_sxtxk = np.zeros([n_seed, n_round +1, k])
-    score_sxt[:, 0] = np.nan
-    jkpluscov_sxtxk[:, 0] = np.nan
-    jkcov_sxtxk[:, 0] = np.nan
-    jklen_sxtxk[:, 0] = np.nan
-    jkplen_sxtxk[:, 0] = np.nan
+    model = Ridge(alpha=gamma, fit_intercept=False)
+    model.fit(Xtrain_nxp, ytrain_n) # = Xtrain_nxp
+    alast = model.predict(Xtest_1xp)
+    pred_u = model.predict(Xuniv_uxp)
+    normconst = np.sum(np.exp(lmbda * pred_u))
+    w_n1xy[-1] = np.exp(lmbda * alast) / (ptrain_fn(Xtest_1xp) * normconst)
+    return w_n1xy
+
+def construct_covint_confidence_set_ridge(ys, Xtrain_nxp, ytrain_n, Xtest_1xp, ptrain_fn, Xuniv_uxp, gamma, lmbda,
+                                           alpha: float = 0.1, use_lapack_inversion: bool = True):
+    """
+    :param ys:
+    :return:
+    """
+    n, p = Xtrain_nxp.shape
+    Xaug_n1xp = np.vstack([Xtrain_nxp, Xtest_1xp])
+
+    # compute in-sample and LOO scores
+    scoresis_n1xy = get_ridge_insample_scores(
+        Xaug_n1xp, ytrain_n, ys, gamma, use_lapack_inversion=use_lapack_inversion)
+    scoresloo_n1xy, prediy_nxy, alast, An_nxp, C_nxp = get_ridge_loo_scores(
+        Xaug_n1xp, ytrain_n, ys, gamma, use_lapack_inversion=use_lapack_inversion)
+
+    # likelihood ratios
+    w_n1xy = get_ridge_covint_weights(
+        Xtrain_nxp, ytrain_n, Xtest_1xp, gamma, prediy_nxy, lmbda, C_nxp, An_nxp, ys, Xuniv_uxp, ptrain_fn)
+
+    # ===== construct confidence sets =====
+
+    # LOO score
+    looq_y = get_quantile(alpha, w_n1xy, scoresloo_n1xy)
+    loo_cs = ys[scoresloo_n1xy[-1] <= looq_y]
+
+    # in-sample score
+    isq_y = get_quantile(alpha, w_n1xy, scoresis_n1xy)
+    is_cs = ys[scoresis_n1xy[-1] <= isq_y]
+    return loo_cs, is_cs
+
+
+def construct_covint_confidence_set(ys, Xtrain_nxp, ytrain_n, Xtest_p, ptrain_fn, Xuniv_nxp, model, lmbda,
+                                    alpha: float = 0.1, use_loo_score: bool = False,
+                                    print_every: int = 10, verbose: bool = True):
+    # model needs fit() and predict() methods
+    np.set_printoptions(precision=3)
+
+    cs = []
     t0 = time.time()
+    n = ytrain_n.size
+    Xaug_nxp = np.vstack([Xtrain_nxp, Xtest_p])
+    scores_n1xy, wi_n1xy = np.zeros([n + 1, ys.size]), np.zeros([n + 1, ys.size])
 
-    for seed in range(n_seed):
-        for t in range(1, n_round + 1):
-            # gather rewards from all previous rounds as training data
-            Xtrain_nxp = X_nxp[arms_sxtxk[seed, : t].flatten()]
-            ytrain_n = reward_sxtxk[seed, : t].flatten()
-            n_train = ytrain_n.size
-            score_ = np.zeros([n_train])
-            pluslo_kx, plushi_kx = np.zeros([k, n_train]), np.zeros([k, n_train])
+    for y_idx, y in enumerate(ys):
 
-            # LOO scores
-            for i in range(n_train):
-                tr_idx = np.hstack([np.arange(i), np.arange(i + 1, n_train)])
-                Xtr_nxp, ytr_n = Xtrain_nxp[tr_idx], ytrain_n[tr_idx]
-                Xte_nxp = Xtrain_nxp[i][None, :]
-                ute_n = model.get_uncertainty(X_nxp, np.array([i]), None, uncertainty_type=uncertainty_type)
-                model.fit(Xtr_nxp, ytr_n)  # LOO model mu_{-i}
-                score_[i] = np.abs(ytrain_n[i] - model.predict(Xte_nxp)) / ute_n # LOO score
-                loopred_k = model.predict(X_nxp[arms_sxtxk[seed, t].flatten()])  # \hat{mu}_{-i}(X_{n + 1})
-                pluslo_kx[:, i] = loopred_k - score_[i] * u_sxtxk[seed, t]
-                plushi_kx[:, i] = loopred_k + score_[i] * u_sxtxk[seed, t]
+        # get scores V_i^(x, y) for i = 1, ldots, n + 1
+        yaug_n = np.hstack([ytrain_n, y])
+        scores_n1 = get_scores(model, Xaug_nxp, yaug_n, use_loo_score=use_loo_score)
+        scores_n1xy[:, y_idx] = scores_n1
 
-            # take quantile of scores
-            score_sxt[seed, t] = np.quantile(score_, 1 - alpha)
+        # get w(x_i; z_{-i}) for i = 1, ..., n + 1
+        wi_n1 = get_lrs(Xaug_nxp, yaug_n, ptrain_fn, Xuniv_nxp, lmbda, model)
+        wi_n1xy[:, y_idx] = wi_n1
 
-            # coverage for jackknife interval
-            lbcov_k = reward_sxtxk[seed, t] >= pred_sxtxk[seed, t] - score_sxt[seed, t] * u_sxtxk[seed, t]
-            ubcov_k = reward_sxtxk[seed, t] <= pred_sxtxk[seed, t] + score_sxt[seed, t] * u_sxtxk[seed, t]
-            jkcov_sxtxk[seed, t] = lbcov_k * ubcov_k
-            jklen_sxtxk[seed, t] = 2 * score_sxt[seed, t] * u_sxtxk[seed, t]
+        # for each value of inverse temperature lambda, compute quantile of weighted scores
+        q = get_quantile(alpha, wi_n1, scores_n1)
 
-            # coverage for jackknife+ interval
-            lb_k = qhatminus(pluslo_kx, alpha)
-            ub_k = qhatplus(plushi_kx, alpha)
-            lbcov_k = reward_sxtxk[seed, t] >= lb_k
-            ubcov_k = reward_sxtxk[seed, t] <= ub_k
-            jkpluscov_sxtxk[seed, t] = lbcov_k * ubcov_k
-            jkplen_sxtxk[seed, t, :] = ub_k - lb_k
+        # if y <= quantile, include in confidence set
+        if scores_n1[-1] <= q:
+            cs.append(y)
 
-        if (seed + 1) % print_every == 0:
-            jkpluscov = np.mean(jkpluscov_sxtxk[: seed + 1, -1])
-            jkcov = np.mean(jkcov_sxtxk[: seed + 1, -1])
-            print("Done with {} / {} seeds. Final JK, JK+ coverage: {:.4f}, {:.4f}. {:.1f} s".format(
-                seed + 1, n_seed, jkcov, jkpluscov, time.time() - t0))
-    return score_sxt, jkcov_sxtxk, jkpluscov_sxtxk, jklen_sxtxk, jkplen_sxtxk
+        # print progress
+        if verbose and (y_idx + 1) % print_every == 0:
+            print("Done with {} / {} y values ({:.1f} s): {}".format(
+                y_idx + 1, ys.size, time.time() - t0, np.array(cs)))
+    return np.array(cs), scores_n1xy, wi_n1xy
 
 
-def calibrate(alpha: float, reward_sxtxk, pred_sxtxk, u_sxtxk, signed: bool = True, conformal_window: int = 50):
-    n_seed, tmp, k = reward_sxtxk.shape
-    n_round = tmp - 1
+def construct_covshift_confidence_set_ridge(ys, Xtrain_nxp, ytrain_n, Xtest_1xp, ptrain_fn, Xuniv_nxp, gamma, lmbda,
+                                            alpha: float = 0.1, use_lapack_inversion: bool = True):
 
-    # compute calibrated intervals
-    signedres_sxtxk = reward_sxtxk - pred_sxtxk # [:, 0, :] will be np.nan because no predictions
-    interval_sxtxkx2 = np.zeros([n_seed, n_round + 1, k, 2])
-    interval_sxtxkx2[:, : 2] = np.nan  # only have data to make intervals for t = 2 onward
-    miscov_sxtxkx2 = np.zeros([n_seed, n_round + 1, k, 2])
-    miscov_sxtxkx2[:, 0] = np.nan
-    score_sxtxk = signedres_sxtxk / u_sxtxk
+    n, p = Xtrain_nxp.shape
+    Xaug_n1xp = np.vstack([Xtrain_nxp, Xtest_1xp])
+    model = Ridge(alpha=gamma, fit_intercept=False)
+    model.fit(Xtrain_nxp, ytrain_n)
 
-    for seed in range(n_seed):
-        for t in range(2, n_round + 1):
+    # ==== compute likelihood ratios =====
+    # get normalization constant for test covariate distribution
+    predall_n = model.predict(Xuniv_nxp)
+    Z = np.sum(np.exp(lmbda * predall_n))
 
-            # compute intervals
-            # if t == 2:
-            #     t0 = 1
-            # else:
-            t0 = np.max([1, t - conformal_window])
-            if signed:
-                s_txk = signedres_sxtxk[seed, t0 : t] / u_sxtxk[seed, t0 : t]
-                qlow = np.quantile(s_txk, alpha / 2)  # does not treat the k guys differently
-                qhigh = np.quantile(s_txk, 1 - (alpha / 2))
-                interval_sxtxkx2[seed, t, :, 0] = pred_sxtxk[seed, t] + qlow * u_sxtxk[seed, t]
-                interval_sxtxkx2[seed, t, :, 1] = pred_sxtxk[seed, t] + qhigh * u_sxtxk[seed, t]
-            else:
-                s_txk = np.abs(signedres_sxtxk[seed, t0 : t]) / u_sxtxk[seed, t0 : t]
-                q = np.quantile(s_txk, 1 - alpha)  # does not treat the k guys differently
-                interval_sxtxkx2[seed, t, :, 0] = pred_sxtxk[seed, t] - q * u_sxtxk[seed, t]
-                interval_sxtxkx2[seed, t, :, 1] = pred_sxtxk[seed, t] + q * u_sxtxk[seed, t]
+    # get weights (likelihood ratios) for n + 1 covariates
+    pred_n1 = model.predict(Xaug_n1xp)
+    ptest_n1 = np.exp(lmbda * pred_n1) / Z
+    wi_n1 = ptest_n1 / ptrain_fn(Xaug_n1xp)
 
-            # check miscoverage
-            miscov_sxtxkx2[seed, t, :, 0] = reward_sxtxk[seed, t] < interval_sxtxkx2[seed, t, :, 0]
-            miscov_sxtxkx2[seed, t, :, 1] = reward_sxtxk[seed, t] > interval_sxtxkx2[seed, t, :, 1]
-    return interval_sxtxkx2, miscov_sxtxkx2, score_sxtxk
+    # ===== compute scores =====
+
+    # for in-sample score, only need to train one model for scores
+    cov_pxp = Xaug_n1xp.T.dot(Xaug_n1xp) + gamma * np.eye(p)
+    if use_lapack_inversion:
+        zz, _ = sc.linalg.lapack.dpotrf(cov_pxp, False, False)
+        invcovtri_pxp, info = sc.linalg.lapack.dpotri(zz)
+        assert(info == 0)
+        invcov_pxp = np.triu(invcovtri_pxp) + np.triu(invcovtri_pxp, k=1).T
+    else:
+        invcov_pxp = sc.linalg.pinvh(cov_pxp)
+    A = invcov_pxp.dot(Xaug_n1xp.T)  # p x (n + 1)
+    C = A[:, : -1].dot(ytrain_n)  # p elements
+
+    a_n1 = C.dot(Xaug_n1xp.T)
+    b_n1 = A[:, -1].dot(Xaug_n1xp.T)
+
+    scoresis_n1xy = np.zeros([n + 1, ys.size])
+    by_n1xy = np.outer(b_n1, ys)
+    muhaty_n1xy = a_n1[:, None] + by_n1xy
+    scoresis_n1xy[: -1] = np.abs(ytrain_n[:, None] - muhaty_n1xy[: -1])
+    scoresis_n1xy[-1] = np.abs(ys - muhaty_n1xy[-1])
+
+    # for LOO score, train n + 1 LOO models, store linear parameterizations of \mu_{-i, y}(X_i) as function of y
+    ab_nx2 = np.zeros([n, 2])
+    C_nxp = np.zeros([n, p])
+    An_nxp = np.zeros([n, p])
+    for i in range(n):
+        # construct A_{-i}
+        Xi_nxp = np.vstack([Xaug_n1xp[: i], Xaug_n1xp[i + 1 :]]) # n rows
+        cov_pxp = Xi_nxp.T.dot(Xi_nxp) + gamma * np.eye(p)
+        if use_lapack_inversion:
+            zz, _ = sc.linalg.lapack.dpotrf(cov_pxp, False, False)
+            invcovtri_pxp, info = sc.linalg.lapack.dpotri(zz)
+            assert(info == 0)
+            invcov_pxp = np.triu(invcovtri_pxp) + np.triu(invcovtri_pxp, k=1).T
+        else:
+            invcov_pxp = sc.linalg.pinvh(cov_pxp)
+        Ai = invcov_pxp.dot(Xi_nxp.T)  # p x n
+        # cov_pxp = Xi_nxp.T.dot(Xi_nxp) + gamma * np.eye(p)  # not as fast as sc.linalg.pinvh
+        # Ai = np.linalg.solve(cov_pxp, Xi_nxp.T)
+
+        # compute linear parameterizations of \mu_{-i, y}(X_i)
+        yi_ = np.hstack([ytrain_n[: i], ytrain_n[i + 1 :]])  # n - 1 elements
+        Ci = Ai[:, : -1].dot(yi_) # p elements
+        ai = Ci.dot(Xtrain_nxp[i])
+        bi = Ai[:, -1].dot(Xtrain_nxp[i])
+
+        # store
+        ab_nx2[i] = ai, bi
+        C_nxp[i] = Ci
+        An_nxp[i] = Ai[:, -1]
+
+    # i = n + 1 case
+    alast = model.predict(Xtest_1xp)  # a_{n + 1}
+
+    # compute LOO scores for each candidate value y
+    scoresloo_n1xy = np.zeros([n + 1, ys.size])
+    by_nxy = np.outer(ab_nx2[:, 1], ys)
+    muhatiy_nxy = ab_nx2[:, 0][:, None] + by_nxy
+    scoresloo_n1xy[: -1] = np.abs(ytrain_n[:, None] - muhatiy_nxy)
+    scoresloo_n1xy[-1] = np.abs(ys - alast)
+
+    # ===== construct confidence sets =====
+
+    # keep y values that fall under weighted quantile
+    wi_n1xy = wi_n1[:, None] * np.ones([n + 1, ys.size])
+    looq_y = get_quantile(alpha, wi_n1xy, scoresloo_n1xy)
+    loo_cs = ys[scoresloo_n1xy[-1] <= looq_y]
+
+    isq_y = get_quantile(alpha, wi_n1xy, scoresis_n1xy)
+    is_cs = ys[scoresis_n1xy[-1] <= isq_y]
+    return loo_cs, is_cs
 
 
 
-def design_and_calibrate(model: FitnessModel, data: Assay, alpha: float = 0.1, k: int = 1, n_round: int = 200,
-                         initial_idx: np.array = None, exclude_observed: bool = True, n_seed: int = 1000,
-                         conformal_window: int = 50, print_every_seed: int = 10, print_every_it: int = 100,
-                         uncertainty_type: str = "inverse_prediction", signed_residuals: bool = False):
-    arms_sxtxk = np.zeros([n_seed, n_round + 1, k])
-    reward_sxtxk = np.zeros([n_seed, n_round + 1, k])
-    pred_sxtxk = np.zeros([n_seed, n_round + 1, k])
-    pred_sxtxk[:, 0, :] = np.nan  # no predictions for initial training data at t = 0
-    u_sxtxk = np.zeros([n_seed, n_round + 1, k])
-    u_sxtxk[:, 0, :] = np.nan  # no notion of uncertainty for initial training data
-    intlb_sxtxk = np.zeros([n_seed, n_round + 1, k])
-    rmse_sxt = np.zeros([n_seed, n_round + 1])  #  RMSE on entire space
-    rmse_sxt[:, 0] = np.nan
+def construct_covshift_confidence_set(ys, Xtrain_nxp, ytrain_n, Xtest_p, ptrain_fn, model, Xuniv_nxp, lmbda,
+                                    alpha: float = 0.1, print_every: int = 10):
+    """
+    :param ys: candidate y values for Xtest_p
+    :param Xtrain_nxp:
+    :param ytrain_n:
+    :param Xtest_p:
+    :param ptrain_fn: function that returns array of likelihood(s) for input n x p array of covariates
+    :param model: already fitted! fit() and predict() methods
+    :param lmbda: float, inverse temperature
+    :param alpha: float, miscoverage
+    :param print_every:
+    :return: numpy array of y values
+    """
+    np.set_printoptions(precision=3)
 
-    if initial_idx is None:
-        initial_idx = np.arange(data.n)
+    cs = []
+    t0 = time.time()
+    Xaug_nxp = np.vstack([Xtrain_nxp, Xtest_p])
 
-    time0 = time.time()
-    # run design
-    for seed in range(n_seed):
+    # get normalization constant for test covariate distribution
+    predall_n = model.predict(Xuniv_nxp)
+    punnorm_n = np.exp(lmbda * predall_n)
+    Z = np.sum(punnorm_n)
 
-        # select initial training sequence(s) and get measurements
-        arms_k = np.random.choice(initial_idx, size=k, replace=False)
-        arms_sxtxk[seed, 0] = arms_k
-        y_n = data.get_measurements(arms_k)
-        reward_sxtxk[seed, 0] = y_n
-        intlb_2xk = np.array(sc.stats.norm.interval(1 - alpha, scale=data.se_n[arms_k]))
-        intlb_sxtxk[seed, 0] = intlb_2xk[1] - intlb_2xk[0]
+    # get weights (likelihood ratios) for n + 1 covariates
+    pred_n1 = model.predict(Xaug_nxp)  # need to call this first before refitting below for candidate y values!
+    punnorm_n1 = np.exp(lmbda * pred_n1)
+    ptest_n1 = punnorm_n1 / Z
+    w_n1 = ptest_n1 / ptrain_fn(Xaug_nxp)
+    scoresnoloo_n1xy = np.zeros([Xaug_nxp.shape[0], ys.size])
 
-        for t in range(1, n_round + 1):
+    for y_idx, y in enumerate(ys):
 
-            # (re)fit model, design new sequences, get model uncertainty on them
-            model.fit(data.X_nxp[arms_k], y_n)
+        # get scores
+        yaug_n = np.hstack([ytrain_n, y])
+        scores_n1 = get_scores(model, Xaug_nxp, yaug_n)
+        scoresnoloo_n1xy[:, y_idx] = scores_n1
 
-            # RMSE on all unseen proteins
-            test_idx = np.delete(np.arange(data.y_n.size), arms_k)
-            pred_n = model.predict(data.X_nxp[test_idx])
-            rmse = np.sqrt(np.mean(np.square(pred_n - data.y_n[test_idx])))
-            rmse_sxt[seed, t] = rmse
+        # compute quantile of weighted scores
+        q = get_quantile(alpha, w_n1, scores_n1)
 
-            newarms_k = model.get_next_sequences(data.X_nxp, k, exclude_idx=arms_k if exclude_observed else None)
-            arms_sxtxk[seed, t] = newarms_k
-            u_sxtxk[seed, t] = model.get_uncertainty(data.X_nxp, newarms_k, arms_k, uncertainty_type=uncertainty_type)
-            intlb_2xk = np.array(sc.stats.norm.interval(1 - alpha, scale=data.se_n[newarms_k]))
-            intlb_sxtxk[seed, t] = intlb_2xk[1] - intlb_2xk[0]
+        # if y <= quantile, include in confidence set
+        if scores_n1[-1] <= q:
+            cs.append(y)
 
-            # make predictions on new sequences
-            pred_sxtxk[seed, t] = model.predict(data.X_nxp[newarms_k])
-
-            # get measurements on new sequences
-            ynew_n = data.get_measurements(newarms_k)
-            reward_sxtxk[seed, t] = ynew_n
-
-            # concatenate arms and rewards
-            arms_k = np.hstack([arms_k, newarms_k])
-            y_n = np.hstack([y_n, ynew_n])
-
-            if ((seed + 1) % print_every_seed == 0) and (t % print_every_it == 0):
-                print("Iter {}. Mean reward: {:.3f}".format(t, np.mean(ynew_n)))
-
-        if (seed + 1) % print_every_seed == 0:
-            print("Done with seed {} /  {} ({:.1f} s). Max reward: {:.3f}".format(
-                seed + 1, n_seed, time.time() - time0, np.max(reward_sxtxk[seed])))
-
-    # compute calibrated intervals
-    print("Computing intervals...")
-    interval_sxtxkx2, coverage_sxtxkx2, score_sxtxk = calibrate(
-        alpha, reward_sxtxk, pred_sxtxk, u_sxtxk, signed=signed_residuals, conformal_window=conformal_window)
-    print("Done ({:.1f} s)".format(time.time() - time0))
-    return pred_sxtxk, reward_sxtxk, u_sxtxk, interval_sxtxkx2, coverage_sxtxkx2, intlb_sxtxk, arms_sxtxk.astype(int), score_sxtxk, rmse_sxt
+        # print progress
+        if (y_idx + 1) % print_every == 0:
+            print("Done with {} / {} y values ({:.1f} s): {}".format(
+                y_idx + 1, ys.size, time.time() - t0, np.array(cs)))
+    return np.array(cs), scoresnoloo_n1xy
 

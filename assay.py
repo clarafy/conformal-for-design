@@ -55,14 +55,21 @@ class PoelwijkData(Assay):
     fitness_names = ['red', 'blue']
 
     def __init__(self, fitness: str, order: int = 1, noise_scale: float = 1., append_distance: bool = False,
-                 order_est_noise: int = 7, sig_level: float = 0.01, load_precomputed_noise: bool = True):
+                 order_est_noise: int = 7, sig_level: float = 0.01, intercept_value: float = 1000.,
+                 load_precomputed_noise: bool = True):
         if fitness not in self.fitness_names:
             raise ValueError('Unrecognized fitness name: {}'.format(fitness))
+
+        # TODO
+        print("Feature normalization won't work w/ WT-centered distribution!")
 
         # ===== featurize sequences as higher-order interactions =====
         df = self.read_poelwijk_supp3()
         self.Xsigned_nxp = self.strarr2signedarr(df.binary_genotype)  # 1/-1 encoding of sequences
         self.X_nxp = util.walsh_hadamard_from_seqs(self.Xsigned_nxp, order=order) # featurize
+        Xstd_1xp = np.std(self.X_nxp, axis=0, keepdims=True)
+        self.X_nxp[:, 1 :] = self.X_nxp[:, 1 :] / Xstd_1xp[:, 1 :]
+        self.X_nxp[:, 0] = intercept_value * np.ones([self.X_nxp.shape[0]])
 
         # ESM-1v masked marginal as feature
         # d = np.load('../poelwijk/esm_mm.npz')
