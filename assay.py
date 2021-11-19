@@ -55,7 +55,7 @@ class PoelwijkData(Assay):
     fitness_names = ['red', 'blue']
 
     def __init__(self, fitness: str, order: int = 1, noise_scale: float = 1., append_distance: bool = False,
-                 order_est_noise: int = 7, sig_level: float = 0.01, intercept_value: float = 1000.,
+                 noise_estimate_order: int = 7, sig_level: float = 0.01,
                  load_precomputed_noise: bool = True):
         if fitness not in self.fitness_names:
             raise ValueError('Unrecognized fitness name: {}'.format(fitness))
@@ -66,10 +66,11 @@ class PoelwijkData(Assay):
         # ===== featurize sequences as higher-order interactions =====
         df = self.read_poelwijk_supp3()
         self.Xsigned_nxp = self.strarr2signedarr(df.binary_genotype)  # 1/-1 encoding of sequences
-        self.X_nxp = util.walsh_hadamard_from_seqs(self.Xsigned_nxp, order=order) # featurize
+        self.X_nxp = util.walsh_hadamard_from_seqs(self.Xsigned_nxp, order=order) # featurize including intercept
+
+        # normalizing all non-intercept features
         Xstd_1xp = np.std(self.X_nxp, axis=0, keepdims=True)
         self.X_nxp[:, 1 :] = self.X_nxp[:, 1 :] / Xstd_1xp[:, 1 :]
-        self.X_nxp[:, 0] = intercept_value * np.ones([self.X_nxp.shape[0]])
 
         # ESM-1v masked marginal as feature
         # d = np.load('../poelwijk/esm_mm.npz')
@@ -101,9 +102,9 @@ class PoelwijkData(Assay):
                 d['order_est_noise'], d['sig_level']))
         else:
             t0 = time.time()
-            X_nxp = util.walsh_hadamard_from_seqs(Xsigned_nxp, order=order_est_noise)
+            X_nxp = util.walsh_hadamard_from_seqs(self.Xsigned_nxp, order=noise_estimate_order)
             n_term = X_nxp.shape[1]
-            print('Estimating noise using {} interaction terms up to order {}'.format(n_term, order_est_noise))
+            print('Estimating noise using {} interaction terms up to order {}'.format(n_term, noise_estimate_order))
             ols = LinearRegression(fit_intercept=False)
             ols.fit(X_nxp, self.y_n)
             pred_n = ols.predict(X_nxp)
@@ -124,17 +125,9 @@ class PoelwijkData(Assay):
 
             self.se_n = np.abs(pred_n - self.y_n)
             self.noise_scale = noise_scale
-            # np.savez('../poelwijk/{}_noise.npz'.format(fitness),
-            #          se_n=self.se_n, order_est_noise=order_est_noise, pvals=pvals, threshold=threshold,
-            #          sigterm_idx=sigterm_idx, n_term=n_term, sig_level=sig_level)
-
-        # following Fowler et al. computation of fitness
-        # y_n = np.log((counts_n+0.5) / (counts_n[0]+0.5)) - np.log((df.counts_input+0.5) / (df.counts_input[0]+0.5))
-        # self.y_n = np.array(y_n)
-
-        # Fowler et al. estimate of SE
-        # se_n = np.sqrt((1/(df.counts_input+0.5)) + (1/(df.counts_input[0]+0.5))+ (1/(counts_n+0.5)) + (1/(counts_n[0]+0.5)))
-
+            np.savez('../poelwijk/{}_noise.npz'.format(fitness),
+                     se_n=self.se_n, noise_estimate_order=noise_estimate_order, pvals=pvals, threshold=threshold,
+                     sigterm_idx=sigterm_idx, n_term=n_term, sig_level=sig_level)
 
     def find(self, Xsigned_nxp):
         return np.array([np.where((self.Xsigned_nxp == X_p).all(axis=1))[0][0] for X_p in Xsigned_nxp])
