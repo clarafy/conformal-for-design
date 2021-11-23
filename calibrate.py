@@ -89,7 +89,6 @@ class ConformalRidge(ABC):
         return Z
 
     def get_insample_scores(self, Xaug_n1xp, ytrain_n):
-        # t0 = time.time()
         A = get_invcov_dot_xt(Xaug_n1xp, self.gamma, use_lapack=self.use_lapack)
         C = A[:, : -1].dot(ytrain_n)  # p elements
         a_n1 = C.dot(Xaug_n1xp.T)
@@ -101,7 +100,6 @@ class ConformalRidge(ABC):
         muhatiy_n1xy = a_n1[:, None] + by_n1xy
         scoresis_n1xy[: -1] = np.abs(ytrain_n[:, None] - muhatiy_n1xy[: -1])
         scoresis_n1xy[-1] = np.abs(self.ys - muhatiy_n1xy[-1])
-        # print("finished in-sample scores {}".format(time.time() - t0))
         return scoresis_n1xy
 
     def compute_loo_scores_and_lrs(self, Xaug_n1xp, ytrain_n, lmbda, compute_lrs: bool = True):

@@ -7,41 +7,9 @@ import scipy as sc
 import pandas as pd
 
 from sklearn.linear_model import LinearRegression
-
-
 import util
 
 HIS3P_ALPHASZS = [2, 2, 3, 2, 2, 3, 3, 4, 2, 4, 4]
-
-class MSAMarginals():
-    def __init__(self):
-        pass
-
-    def fit(self, msa_n, pseudocount: int = 1):
-        print("Converting unknown AA symbols into gaps.")
-        self.msa_nxl = np.array([[aa if aa in util.AA else '-' for aa in seq] for seq in msa_n])  # convert unk to hyphen
-        n, l = self.msa_nxl.shape
-        freq_lxa = np.zeros([l, len(util.AA)])
-        for i, aa in enumerate(util.AA):
-            counts_l = np.sum(self.msa_nxl == aa, axis=0)
-            freq_lxa[:, i] = (counts_l + pseudocount) / (n + (len(util.AA) * pseudocount))
-        self.freq_lxa = freq_lxa
-        self.pseudocount = pseudocount
-        return freq_lxa
-
-    def predict_variant(self, mutstr):
-        muts = mutstr.split(":")
-        pred = 0
-        for mut in muts:
-            aaold, pos, aanew = parse.parse("{}{:d}{}", mut)
-            if (self.msa_nxl[0, pos - 1] != aaold):
-                raise ValueError("WT does not match provided mutation string: {}".format(mut))
-            aanew_idx = util.AA.index(aanew)
-            pred += np.log(self.freq_lxa[pos - 1, aanew_idx])
-        return pred
-
-    def predict(self, mutstr_n):
-        return np.array([self.predict_variant(mutstr) for mutstr in mutstr_n])
 
 class Assay(ABC):
     def __init__(self):
@@ -60,29 +28,20 @@ class PoelwijkData(Assay):
         if fitness not in self.fitness_names:
             raise ValueError('Unrecognized fitness name: {}'.format(fitness))
 
-        # TODO
-        print("Feature normalization won't work w/ WT-centered distribution!")
-
         # ===== featurize sequences as higher-order interactions =====
         df = self.read_poelwijk_supp3()
         self.Xsigned_nxp = self.strarr2signedarr(df.binary_genotype)  # 1/-1 encoding of sequences
         self.X_nxp = util.walsh_hadamard_from_seqs(self.Xsigned_nxp, order=order) # featurize including intercept
 
-        # normalizing all non-intercept features
-        Xstd_1xp = np.std(self.X_nxp, axis=0, keepdims=True)
-        self.X_nxp[:, 1 :] = self.X_nxp[:, 1 :] / Xstd_1xp[:, 1 :]
+        # normalizing all non-intercept features: WHT already orthonormal basis!
+        # Xstd_1xp = np.std(self.X_nxp, axis=0, keepdims=True)
+        # self.X_nxp[:, 1 :] = self.X_nxp[:, 1 :] / Xstd_1xp[:, 1 :]
 
         # ESM-1v masked marginal as feature
         # d = np.load('../poelwijk/esm_mm.npz')
         # feat_n = np.mean(d['score_nx5'], axis=1)
         # self.X_nxp = np.hstack([self.X_nxp, feat_n[:, None]])
 
-        if append_distance:  # this is a linear combination of existing features...
-            # distance from WT as feature
-            feat_n = np.sum((self.X_nxp[:, 1 : 14] + 1) / 2, axis=1)
-            if fitness == 'red':
-                feat_n = 13 - feat_n
-            self.X_nxp = np.hstack([feat_n[:, None], self.X_nxp])
         self.n, self.p = self.X_nxp.shape
         self.order = order
         print('{} features'.format(self.p))
@@ -191,7 +150,7 @@ class PokusaevaData(Assay):
     alphabet_szs = [2, 2, 3, 2, 2, 3, 3, 4, 2, 4, 4]
     def __init__(self, order: int = 3, noise_scale: float = 1., load_precomputed: bool = True):
         # TODO: load pre-computed Fourier encodings
-        print('No noise model for Pokusaeva data.')  # TODO: all 11(12?) datasets, w/ noise model using estimated error
+        print('No noise model for Pokusaeva data.')
         d = np.load('/home/clarafy/waterslides/FitnessSparsity/results/his3p_big_data.npy', allow_pickle=True).item()
         intseqs, yorig_n = d['seq'], np.array(d['y'])
         self.order = order
