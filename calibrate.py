@@ -2,6 +2,8 @@ import numpy as np
 import time
 import scipy as sc
 
+from abc import ABC, abstractmethod
+
 # ========== conformal utilities ==========
 
 def get_wt_centered_train_data(wt_is_1, n_sample, p_mutate, seed: int = None):
@@ -29,7 +31,6 @@ def weighted_quantile(vals_n, weights_n, quantile, tol: float = 1e-12):
 
     cumweight_n = np.cumsum(weights_n)
     idx = np.searchsorted(cumweight_n, quantile, side='left')
-    # idx = np.min(np.where(cumweight_n >= quantile)[0])
     return vals_n[idx]
 
 def get_quantile(alpha, w_n1xy, scores_n1xy):
@@ -72,8 +73,7 @@ def get_invcov_dot_xt(X_nxp, gamma, use_lapack: bool = True):
     return invcov_pxp.dot(X_nxp.T)
 
 
-
-class ConformalRidge():
+class ConformalRidge(ABC):
     def __init__(self, ptrain_fn, ys, Xuniv_uxp, gamma, use_lapack: bool = True):
         self.ptrain_fn = ptrain_fn
         self.Xuniv_uxp = Xuniv_uxp
@@ -89,6 +89,7 @@ class ConformalRidge():
         return Z
 
     def get_insample_scores(self, Xaug_n1xp, ytrain_n):
+        # t0 = time.time()
         A = get_invcov_dot_xt(Xaug_n1xp, self.gamma, use_lapack=self.use_lapack)
         C = A[:, : -1].dot(ytrain_n)  # p elements
         a_n1 = C.dot(Xaug_n1xp.T)
@@ -100,9 +101,10 @@ class ConformalRidge():
         muhatiy_n1xy = a_n1[:, None] + by_n1xy
         scoresis_n1xy[: -1] = np.abs(ytrain_n[:, None] - muhatiy_n1xy[: -1])
         scoresis_n1xy[-1] = np.abs(self.ys - muhatiy_n1xy[-1])
+        # print("finished in-sample scores {}".format(time.time() - t0))
         return scoresis_n1xy
 
-    def get_loo_scores_and_lrs(self, Xaug_n1xp, ytrain_n, lmbda, compute_lrs: bool = True):
+    def compute_loo_scores_and_lrs(self, Xaug_n1xp, ytrain_n, lmbda, compute_lrs: bool = True):
         # fit n + 1 LOO models and store linear parameterizations of \mu_{-i, y}(X_i) as function of y
         n = ytrain_n.size
         ab_nx2 = np.zeros([n, 2])
@@ -124,10 +126,11 @@ class ConformalRidge():
             C_nxp[i] = Ci
             An_nxp[i] = Ai[:, -1]
 
+
         # LOO score for i = n + 1
         tmp = get_invcov_dot_xt(Xaug_n1xp[: -1], self.gamma, use_lapack=self.use_lapack)
         beta_p = tmp.dot(ytrain_n)
-        alast = beta_p.dot(Xaug_n1xp[-1])  # a_{n + 1}. Xaug_n1xp[-1] = Xtest_p
+        alast = beta_p.dot(Xaug_n1xp[-1])  # prediction a_{n + 1}. Xaug_n1xp[-1] = Xtest_p
 
         # process LOO scores for each candidate value y
         scoresloo_n1xy = np.zeros([n + 1, self.n_y])
@@ -136,27 +139,26 @@ class ConformalRidge():
         scoresloo_n1xy[: -1] = np.abs(ytrain_n[:, None] - prediy_nxy)
         scoresloo_n1xy[-1] = np.abs(self.ys - alast)
 
-        # likelihood ratios for each candidate value y
-        betaiy_nxpxy = C_nxp[:, :, None] + self.ys * An_nxp[:, :, None]
-        pred_nxyxu = np.tensordot(betaiy_nxpxy, self.Xuniv_uxp, axes=(1, 1))
-        normconst_nxy = np.sum(np.exp(lmbda * pred_nxyxu), axis=2)
-        ptrain_n = self.ptrain_fn(Xaug_n1xp[: -1])
-
         w_n1xy = None
+        # likelihood ratios for each candidate value y
         if compute_lrs:
+            betaiy_nxpxy = C_nxp[:, :, None] + self.ys * An_nxp[:, :, None]
+            pred_nxyxu = np.tensordot(betaiy_nxpxy, self.Xuniv_uxp, axes=(1, 1))
+            normconst_nxy = np.sum(np.exp(lmbda * pred_nxyxu), axis=2)
+            ptrain_n = self.ptrain_fn(Xaug_n1xp[: -1])
+
             w_n1xy = np.zeros([n + 1, self.n_y])
             wi_num_nxy = np.exp(lmbda * prediy_nxy)
             w_n1xy[: -1] = wi_num_nxy / (ptrain_n[:, None] * normconst_nxy)
 
+            # for last i = n + 1, which is constant across candidate values of y
             Z = self.get_normalizing_constant(beta_p, lmbda)
             w_n1xy[-1] = np.exp(lmbda * alast) / (self.ptrain_fn(Xaug_n1xp[-1][None, :]) * Z)
         return scoresloo_n1xy, w_n1xy
 
-
-
-class ConformalRidgeCovariateIntervention(ConformalRidge):
-    def __init__(self, ptrain_fn, ys, Xuniv_uxp, gamma, use_lapack: bool = True):
-        super().__init__(ptrain_fn, ys, Xuniv_uxp, gamma, use_lapack=use_lapack)
+    @abstractmethod
+    def get_loo_scores_and_lrs(self, Xaug_n1xp, ytrain_n, lmbda):
+        pass
 
     def get_confidence_set(self, Xtrain_nxp, ytrain_n, Xtest_1xp, lmbda, alpha: float = 0.1):
         if (self.p != Xtrain_nxp.shape[1]):
@@ -170,7 +172,7 @@ class ConformalRidgeCovariateIntervention(ConformalRidge):
         scoresis_n1xy = self.get_insample_scores(Xaug_n1xp, ytrain_n)
 
         # compute LOO scores and likelihood ratios
-        scoresloo_n1xy, w_n1xy = self.get_loo_scores_and_lrs(Xaug_n1xp, ytrain_n, lmbda, compute_lrs=True)
+        scoresloo_n1xy, w_n1xy = self.get_loo_scores_and_lrs(Xaug_n1xp, ytrain_n, lmbda)
 
         # ===== construct confidence sets =====
 
@@ -182,6 +184,15 @@ class ConformalRidgeCovariateIntervention(ConformalRidge):
         isq_y = get_quantile(alpha, w_n1xy, scoresis_n1xy)
         is_cs = self.ys[scoresis_n1xy[-1] <= isq_y]
         return loo_cs, is_cs
+
+
+class ConformalRidgeCovariateIntervention(ConformalRidge):
+    def __init__(self, ptrain_fn, ys, Xuniv_uxp, gamma, use_lapack: bool = True):
+        super().__init__(ptrain_fn, ys, Xuniv_uxp, gamma, use_lapack=use_lapack)
+
+    def get_loo_scores_and_lrs(self, Xaug_n1xp, ytrain_n, lmbda):
+        scoresloo_n1xy, w_n1xy = self.compute_loo_scores_and_lrs(Xaug_n1xp, ytrain_n, lmbda, compute_lrs=True)
+        return scoresloo_n1xy, w_n1xy
 
 
 
@@ -203,33 +214,14 @@ class ConformalRidgeCovariateShift(ConformalRidge):
         w_n1 = ptest_n1 / self.ptrain_fn(Xaug_n1xp)
         return w_n1
 
-    def get_confidence_set(self, Xtrain_nxp, ytrain_n, Xtest_1xp, lmbda, alpha: float = 0.1):
-        if (self.p != Xtrain_nxp.shape[1]):
-            raise ValueError('Feature dimension {} differs from provided Xuniv_uxp {}'.format(
-                Xtrain_nxp.shape[1], self.Xuniv_uxp.shape))
-        Xaug_n1xp = np.vstack([Xtrain_nxp, Xtest_1xp])
-
-        # ===== compute scores and weights =====
-        # compute in-sample scores
-        scoresis_n1xy = self.get_insample_scores(Xaug_n1xp, ytrain_n)
-
-        # compute LOO scores
-        scoresloo_n1xy, _ = self.get_loo_scores_and_lrs(Xaug_n1xp, ytrain_n, lmbda, compute_lrs=False)
+    def get_loo_scores_and_lrs(self, Xaug_n1xp, ytrain_n, lmbda):
+        # LOO scores
+        scoresloo_n1xy, _ = self.compute_loo_scores_and_lrs(Xaug_n1xp, ytrain_n, lmbda, compute_lrs=False)
 
         # compute likelihood ratios
         w_n1 = self.get_lrs(Xaug_n1xp, ytrain_n, lmbda)
-
-        # ===== construct confidence sets =====
-        # based on LOO score
         w_n1xy = w_n1[:, None] * np.ones([Xaug_n1xp.shape[0], self.n_y])
-        looq_y = get_quantile(alpha, w_n1xy, scoresloo_n1xy)
-        loo_cs = self.ys[scoresloo_n1xy[-1] <= looq_y]
-
-        # based on in-sample score
-        isq_y = get_quantile(alpha, w_n1xy, scoresis_n1xy)
-        is_cs = self.ys[scoresis_n1xy[-1] <= isq_y]
-        return loo_cs, is_cs
-
+        return scoresloo_n1xy, w_n1xy
 
 
 
@@ -255,8 +247,7 @@ def get_scores(model, Xaug_nxp, yaug_n, use_loo_score: bool = False):
         scores_n1 = np.abs(yaug_n - pred_n1)
     return scores_n1
 
-
-class ConformalCovariateIntervention():
+class Conformal(ABC):
     def __init__(self, model, ptrain_fn, ys, Xuniv_uxp):
         self.model = model
         self.ptrain_fn = ptrain_fn
@@ -265,26 +256,9 @@ class ConformalCovariateIntervention():
         self.p = Xuniv_uxp.shape[1]
         self.n_y = ys.size
 
+    @abstractmethod
     def get_lrs(self, Xaug_n1xp, yaug_n1, lmbda):
-
-        # compute weights for each value of lambda, the inverse temperature
-        w_n1 = np.zeros([yaug_n1.size])
-        for i in range(yaug_n1.size):
-
-            # fit LOO model
-            Xtr_nxp = np.vstack([Xaug_n1xp[: i], Xaug_n1xp[i + 1 :]])
-            ytr_n = np.hstack([yaug_n1[: i], yaug_n1[i + 1 :]])
-            self.model.fit(Xtr_nxp, ytr_n)
-
-            # compute normalizing constant
-            predall_n = self.model.predict(self.Xuniv_uxp)
-            Z = np.sum(np.exp(lmbda * predall_n))
-
-            # compute likelihood ratios
-            testpred = self.model.predict(Xaug_n1xp[i][None, :])
-            ptest = np.exp(lmbda * testpred) / Z
-            w_n1[i] = ptest / self.ptrain_fn(Xaug_n1xp[i][None, :])
-        return w_n1
+        pass
 
     def get_confidence_set(self, Xtrain_nxp, ytrain_n, Xtest_1xp, lmbda,
                            use_loo_score: bool = True, alpha: float = 0.1,
@@ -294,16 +268,16 @@ class ConformalCovariateIntervention():
                 Xtrain_nxp.shape[1], self.Xuniv_uxp.shape))
 
         np.set_printoptions(precision=3)
-        cs = []
+        cs, n = [], ytrain_n.size
         t0 = time.time()
         Xaug_n1xp = np.vstack([Xtrain_nxp, Xtest_1xp])
-        scores_n1xy = np.zeros([ytrain_n.size + 1, self.n_y]),
-        w_n1xy = np.zeros([ytrain_n.size + 1, self.n_y])
+        scores_n1xy = np.zeros([n + 1, self.n_y]),
+        w_n1xy = np.zeros([n + 1, self.n_y])
 
         for y_idx, y in enumerate(self.ys):
 
             # get scores
-            yaug_n1 = np.hstack([ytrain_n, y])  # HERE
+            yaug_n1 = np.hstack([ytrain_n, y])
             scores_n1 = get_scores(self.model, Xaug_n1xp, yaug_n1, use_loo_score=use_loo_score)
             scores_n1xy[:, y_idx] = scores_n1
 
@@ -326,75 +300,43 @@ class ConformalCovariateIntervention():
 
 
 
-# def construct_covint_confidence_set(ys, Xtrain_nxp, ytrain_n, Xtest_p, ptrain_fn, Xuniv_nxp, model, lmbda,
-#                                     alpha: float = 0.1, use_loo_score: bool = False,
-#                                     print_every: int = 10, verbose: bool = True):
-#     # model needs fit() and predict() methods
-#     np.set_printoptions(precision=3)
-#     cs = []
-#     t0 = time.time()
-#     n = ytrain_n.size
-#     Xaug_nxp = np.vstack([Xtrain_nxp, Xtest_p])
-#     scores_n1xy, wi_n1xy = np.zeros([n + 1, ys.size]), np.zeros([n + 1, ys.size])
-#
-#     for y_idx, y in enumerate(ys):
-#
-#         # get scores V_i^(x, y) for i = 1, ldots, n + 1
-#         yaug_n = np.hstack([ytrain_n, y])
-#         scores_n1 = get_scores(model, Xaug_nxp, yaug_n, use_loo_score=use_loo_score)
-#         scores_n1xy[:, y_idx] = scores_n1
-#
-#         # get w(x_i; z_{-i}) for i = 1, ..., n + 1
-#         wi_n1 = get_covint_lrs(Xaug_nxp, yaug_n, ptrain_fn, Xuniv_nxp, lmbda, model)
-#         wi_n1xy[:, y_idx] = wi_n1
-#
-#         # for each value of inverse temperature lambda, compute quantile of weighted scores
-#         q = get_quantile(alpha, wi_n1, scores_n1)
-#
-#         # if y <= quantile, include in confidence set
-#         if scores_n1[-1] <= q:
-#             cs.append(y)
-#
-#         # print progress
-#         if verbose and (y_idx + 1) % print_every == 0:
-#             print("Done with {} / {} y values ({:.1f} s): {}".format(
-#                 y_idx + 1, ys.size, time.time() - t0, np.array(cs)))
-#     return np.array(cs), scores_n1xy, wi_n1xy
+class ConformalCovariateIntervention(Conformal):
+    def __init__(self, model, ptrain_fn, ys, Xuniv_uxp):
+        super().__init__(model, ptrain_fn, ys, Xuniv_uxp)
 
-def construct_covshift_confidence_set(ys, Xtrain_nxp, ytrain_n, Xtest_p, ptrain_fn, model, Xuniv_uxp, lmbda,
-                                    alpha: float = 0.1, print_every: int = 10):
-    np.set_printoptions(precision=3)
-    cs = []
-    t0 = time.time()
-    Xaug_nxp = np.vstack([Xtrain_nxp, Xtest_p])
+    def get_lrs(self, Xaug_n1xp, yaug_n1, lmbda):
+        # compute weights for each value of lambda, the inverse temperature
+        w_n1 = np.zeros([yaug_n1.size])
+        for i in range(yaug_n1.size):
 
-    # get normalization constant for test covariate distribution
-    model.fit(Xtrain_nxp, ytrain_n)
-    predall_u = model.predict(Xuniv_uxp)
-    Z = np.sum(np.exp(lmbda * predall_u))
+            # fit LOO model
+            Xtr_nxp = np.vstack([Xaug_n1xp[: i], Xaug_n1xp[i + 1 :]])
+            ytr_n = np.hstack([yaug_n1[: i], yaug_n1[i + 1 :]])
+            self.model.fit(Xtr_nxp, ytr_n)
 
-    # get weights (likelihood ratios) for n + 1 covariates
-    pred_n1 = model.predict(Xaug_nxp)  # need to call this first before refitting below for candidate y values!
-    ptest_n1 = np.exp(lmbda * pred_n1) / Z
-    w_n1 = ptest_n1 / ptrain_fn(Xaug_nxp)
-    scores_n1xy = np.zeros([Xaug_nxp.shape[0], ys.size])
+            # compute normalizing constant
+            predall_n = self.model.predict(self.Xuniv_uxp)
+            Z = np.sum(np.exp(lmbda * predall_n))
 
-    for y_idx, y in enumerate(ys):
+            # compute likelihood ratios
+            testpred = self.model.predict(Xaug_n1xp[i][None, :])
+            ptest = np.exp(lmbda * testpred) / Z
+            w_n1[i] = ptest / self.ptrain_fn(Xaug_n1xp[i][None, :])
+        return w_n1
 
-        # get scores
-        yaug_n = np.hstack([ytrain_n, y])
-        scores_n1 = get_scores(model, Xaug_nxp, yaug_n)
-        scores_n1xy[:, y_idx] = scores_n1
 
-        # compute quantile of weighted scores
-        q = get_quantile(alpha, w_n1, scores_n1)
+class ConformalCovariateShift(Conformal):
+    def __init__(self, model, ptrain_fn, ys, Xuniv_uxp):
+        super().__init__(model, ptrain_fn, ys, Xuniv_uxp)
 
-        # if y <= quantile, include in confidence set
-        if scores_n1[-1] <= q:
-            cs.append(y)
+    def get_lrs(self, Xaug_n1xp, yaug_n1, lmbda):
+        # get normalization constant for test covariate distribution
+        self.model.fit(Xaug_n1xp[: -1], yaug_n1[: -1])  # Xtrain_nxp, ytrain_n
+        predall_u = self.model.predict(self.Xuniv_uxp)
+        Z = np.sum(np.exp(lmbda * predall_u))
 
-        # print progress
-        if (y_idx + 1) % print_every == 0:
-            print("Done with {} / {} y values ({:.1f} s): {}".format(
-                y_idx + 1, ys.size, time.time() - t0, np.array(cs)))
-    return np.array(cs), scores_n1xy
+        # get likelihood ratios
+        pred_n1 = self.model.predict(Xaug_n1xp)
+        ptest_n1 = np.exp(lmbda * pred_n1) / Z
+        w_n1 = ptest_n1 / self.ptrain_fn(Xaug_n1xp)
+        return w_n1
