@@ -6,6 +6,27 @@ from abc import ABC, abstractmethod
 
 # ========== conformal utilities ==========
 
+def get_uniform_train_and_design_test(data, n_train, gamma, lmbda, seed: int = None):
+    # get random training data
+    np.random.seed(seed)
+    train_idx = np.random.choice(data.n, n_train, replace=True)
+    Xtrain_nxp, ytrain_n = data.X_nxp[train_idx], data.get_measurements(train_idx, seed=seed + 1)
+
+    # train model (exclude intercept feature)
+    A_pxn = get_invcov_dot_xt(Xtrain_nxp, gamma, use_lapack=True)
+    beta_p = A_pxn.dot(ytrain_n)
+
+    # construct test covariate distribution
+    predall_n = data.X_nxp.dot(beta_p)
+    punnorm_n = np.exp(lmbda * predall_n)
+    Z = np.sum(punnorm_n)
+
+    # draw test covariate
+    test_idx = np.random.choice(data.n, 1, p=punnorm_n / Z)
+    ytest_1 = data.get_measurements(test_idx, seed=seed + 2)
+    pred_1 = data.X_nxp[test_idx].dot(beta_p)
+    return Xtrain_nxp, ytrain_n, data.X_nxp[test_idx], ytest_1, pred_1
+
 def get_wt_centered_train_data(wt_is_1, n_sample, p_mutate, seed: int = None):
     np.random.seed(seed)
     X_nxp = sc.stats.bernoulli.rvs(1 - p_mutate if wt_is_1 else p_mutate, size=(n_sample, 13))
@@ -34,13 +55,6 @@ def weighted_quantile(vals_n, weights_n, quantile, tol: float = 1e-12):
     return vals_n[idx]
 
 def get_quantile(alpha, w_n1xy, scores_n1xy):
-    """
-    Returns weighted 1 - alpha quantile of n + 1 scores, given likelihood ratios w(x_i; z_{-i}) and scores
-    :param alpha: float, miscoverage level
-    :param w_n1: numpy array, n + 1 likelihood ratios, assuming the last one is w(x_{n + 1}; z_{1:n})
-    :param scores_n1: numpy array, n + 1 scores
-    :return: float
-    """
     if w_n1xy.ndim == 1:
         w_n1xy = w_n1xy[:, None]
         scores_n1xy = scores_n1xy[:, None]
@@ -88,7 +102,7 @@ class ConformalRidge(ABC):
         Z = np.sum(np.exp(lmbda * predall_u))
         return Z
 
-    def get_insample_scores(self, Xaug_n1xp, ytrain_n):
+    def get_insample_scores(self, Xaug_n1xp, ytrain_n, use_adaptive_score: bool = False):
         A = get_invcov_dot_xt(Xaug_n1xp, self.gamma, use_lapack=self.use_lapack)
         C = A[:, : -1].dot(ytrain_n)  # p elements
         a_n1 = C.dot(Xaug_n1xp.T)
@@ -100,9 +114,12 @@ class ConformalRidge(ABC):
         muhatiy_n1xy = a_n1[:, None] + by_n1xy
         scoresis_n1xy[: -1] = np.abs(ytrain_n[:, None] - muhatiy_n1xy[: -1])
         scoresis_n1xy[-1] = np.abs(self.ys - muhatiy_n1xy[-1])
+        # if use_adaptive_score:
+        #     scoresis_n1xy /= np.exp(muhatiy_n1xy)
         return scoresis_n1xy
 
-    def compute_loo_scores_and_lrs(self, Xaug_n1xp, ytrain_n, lmbda, compute_lrs: bool = True):
+    def compute_loo_scores_and_lrs(self, Xaug_n1xp, ytrain_n, lmbda,
+                                   compute_lrs: bool = True, use_adaptive_score: bool = False):
         # fit n + 1 LOO models and store linear parameterizations of \mu_{-i, y}(X_i) as function of y
         n = ytrain_n.size
         ab_nx2 = np.zeros([n, 2])
@@ -136,6 +153,9 @@ class ConformalRidge(ABC):
         prediy_nxy = ab_nx2[:, 0][:, None] + by_nxy
         scoresloo_n1xy[: -1] = np.abs(ytrain_n[:, None] - prediy_nxy)
         scoresloo_n1xy[-1] = np.abs(self.ys - alast)
+        # if use_adaptive_score:
+        #     scoresloo_n1xy[: -1] /= np.exp(prediy_nxy)
+        #     scoresloo_n1xy[-1] /= np.exp(alast)
 
         w_n1xy = None
         # likelihood ratios for each candidate value y
@@ -158,7 +178,8 @@ class ConformalRidge(ABC):
     def get_loo_scores_and_lrs(self, Xaug_n1xp, ytrain_n, lmbda):
         pass
 
-    def get_confidence_set(self, Xtrain_nxp, ytrain_n, Xtest_1xp, lmbda, alpha: float = 0.1):
+    def get_confidence_set(self, Xtrain_nxp, ytrain_n, Xtest_1xp, lmbda,
+                           use_adaptive_score: bool = False, alpha: float = 0.1):
         if (self.p != Xtrain_nxp.shape[1]):
             raise ValueError('Feature dimension {} differs from provided Xuniv_uxp {}'.format(
                 Xtrain_nxp.shape[1], self.Xuniv_uxp.shape))
@@ -167,10 +188,11 @@ class ConformalRidge(ABC):
         # ===== compute scores and weights =====
 
         # compute in-sample scores
-        scoresis_n1xy = self.get_insample_scores(Xaug_n1xp, ytrain_n)
+        scoresis_n1xy = self.get_insample_scores(Xaug_n1xp, ytrain_n, use_adaptive_score=use_adaptive_score)
 
         # compute LOO scores and likelihood ratios
-        scoresloo_n1xy, w_n1xy = self.get_loo_scores_and_lrs(Xaug_n1xp, ytrain_n, lmbda)
+        scoresloo_n1xy, w_n1xy = self.get_loo_scores_and_lrs(
+            Xaug_n1xp, ytrain_n, lmbda, use_adaptive_score=use_adaptive_score)
 
         # ===== construct confidence sets =====
 
@@ -188,8 +210,9 @@ class ConformalRidgeCovariateIntervention(ConformalRidge):
     def __init__(self, ptrain_fn, ys, Xuniv_uxp, gamma, use_lapack: bool = True):
         super().__init__(ptrain_fn, ys, Xuniv_uxp, gamma, use_lapack=use_lapack)
 
-    def get_loo_scores_and_lrs(self, Xaug_n1xp, ytrain_n, lmbda):
-        scoresloo_n1xy, w_n1xy = self.compute_loo_scores_and_lrs(Xaug_n1xp, ytrain_n, lmbda, compute_lrs=True)
+    def get_loo_scores_and_lrs(self, Xaug_n1xp, ytrain_n, lmbda, use_adaptive_score: bool = False):
+        scoresloo_n1xy, w_n1xy = self.compute_loo_scores_and_lrs(
+            Xaug_n1xp, ytrain_n, lmbda, compute_lrs=True, use_adaptive_score=use_adaptive_score)
         return scoresloo_n1xy, w_n1xy
 
 
@@ -212,9 +235,10 @@ class ConformalRidgeCovariateShift(ConformalRidge):
         w_n1 = ptest_n1 / self.ptrain_fn(Xaug_n1xp)
         return w_n1
 
-    def get_loo_scores_and_lrs(self, Xaug_n1xp, ytrain_n, lmbda):
+    def get_loo_scores_and_lrs(self, Xaug_n1xp, ytrain_n, lmbda, use_adaptive_score: bool = False):
         # LOO scores
-        scoresloo_n1xy, _ = self.compute_loo_scores_and_lrs(Xaug_n1xp, ytrain_n, lmbda, compute_lrs=False)
+        scoresloo_n1xy, _ = self.compute_loo_scores_and_lrs(
+            Xaug_n1xp, ytrain_n, lmbda, compute_lrs=False, use_adaptive_score=use_adaptive_score)
 
         # compute likelihood ratios
         w_n1 = self.get_lrs(Xaug_n1xp, ytrain_n, lmbda)
@@ -225,7 +249,7 @@ class ConformalRidgeCovariateShift(ConformalRidge):
 
 # ========== model-agnostic calibration ==========
 
-def get_scores(model, Xaug_nxp, yaug_n, use_loo_score: bool = False):
+def get_scores(model, Xaug_nxp, yaug_n, use_loo_score: bool = False, use_adaptive_score: bool = False):
     if use_loo_score:
         n1 = yaug_n.size  # n + 1
         scores_n1 = np.zeros([n1])
@@ -238,11 +262,15 @@ def get_scores(model, Xaug_nxp, yaug_n, use_loo_score: bool = False):
             model.fit(Xtrain_nxp, ytrain_n)
             pred_1 = model.predict(Xaug_nxp[i][None, :])
             scores_n1[i] = np.abs(yaug_n[i] - pred_1[0])
+            # if use_adaptive_score:
+            #     scores_n1[i] /= np.exp(pred_1[0])
 
     else:  # in-sample score
         model.fit(Xaug_nxp, yaug_n)
         pred_n1 = model.predict(Xaug_nxp)
         scores_n1 = np.abs(yaug_n - pred_n1)
+        # if use_adaptive_score:
+        #     scores_n1 /= np.exp(pred_n1)
     return scores_n1
 
 class Conformal(ABC):
@@ -259,7 +287,7 @@ class Conformal(ABC):
         pass
 
     def get_confidence_set(self, Xtrain_nxp, ytrain_n, Xtest_1xp, lmbda,
-                           use_loo_score: bool = True, alpha: float = 0.1,
+                           use_loo_score: bool = True, use_adaptive_score: bool = False, alpha: float = 0.1,
                            print_every: int = 10, verbose: bool = True):
         if (self.p != Xtrain_nxp.shape[1]):
             raise ValueError('Feature dimension {} differs from provided Xuniv_uxp {}'.format(
@@ -276,7 +304,8 @@ class Conformal(ABC):
 
             # get scores
             yaug_n1 = np.hstack([ytrain_n, y])
-            scores_n1 = get_scores(self.model, Xaug_n1xp, yaug_n1, use_loo_score=use_loo_score)
+            scores_n1 = get_scores(self.model, Xaug_n1xp, yaug_n1,
+                                   use_loo_score=use_loo_score, use_adaptive_score=use_adaptive_score)
             scores_n1xy[:, y_idx] = scores_n1
 
             # get likelihood ratios

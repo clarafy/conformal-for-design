@@ -54,10 +54,10 @@ class PoelwijkData(Assay):
 
         # ===== estimate unexplainable noise via WHT =====
         if load_precomputed_noise:
-            d = np.load('../poelwijk/{}_noise.npz'.format(fitness))
+            d = np.load('/home/clarafy/waterslides/calibrating-design/poelwijk/{}_noise.npz'.format(fitness))
             self.se_n = d['se_n']
             self.noise_scale = noise_scale
-            print("Loading estimated SE precomputed with order {} and significance level {}".format(
+            print("Loading estimated noise SE precomputed with order {} and significance level {}".format(
                 d['order_est_noise'], d['sig_level']))
         else:
             t0 = time.time()
@@ -84,7 +84,7 @@ class PoelwijkData(Assay):
 
             self.se_n = np.abs(pred_n - self.y_n)
             self.noise_scale = noise_scale
-            np.savez('../poelwijk/{}_noise.npz'.format(fitness),
+            np.savez('/home/clarafy/waterslides/calibrating-design/poelwijk/{}_noise.npz'.format(fitness),
                      se_n=self.se_n, noise_estimate_order=noise_estimate_order, pvals=pvals, threshold=threshold,
                      sigterm_idx=sigterm_idx, n_term=n_term, sig_level=sig_level)
 
