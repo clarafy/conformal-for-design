@@ -187,8 +187,8 @@ def intarr2ohearr(Xint_nxp, alphasz_p):
         ohecol = np.zeros([intcol.size, alpha_sz - 1])
         for i in range(intcol.size):
             char = intcol[i]
-            if char:  # if 0, zero embedding
-                ohecol[i, intcol[i] - 1] = 1
+            if char > 1:
+                ohecol[i, char - 2] = 1
         return ohecol
 
     X_nxp = []

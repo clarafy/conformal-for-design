@@ -107,7 +107,10 @@ class PoelwijkData(Assay):
         np.random.seed(seed)
         return np.array([np.random.normal(loc=self.y_n[i], scale=self.noise_scale * self.se_n[i]) for i in x_idx])
 
-
+# print('Only loading assayed Wu data, not imputed data.')
+# intseqs, countin_n, countout_n, yorig_n = self.read_wu_supp1()
+# self.y_n = yorig_n
+# ohe_nxp = util.intarr2ohearr(np.array(intseqs), 4 * [20])
 class WuData(Assay):
     def __init__(self, order: int = 2, noise_scale: float = 1., load_precomputed: bool = True):
         print('Only loading assayed Wu data, not imputed data.')
@@ -148,8 +151,7 @@ class WuData(Assay):
 
 class PokusaevaData(Assay):
     alphabet_szs = [2, 2, 3, 2, 2, 3, 3, 4, 2, 4, 4]
-    def __init__(self, order: int = 3, noise_scale: float = 1., load_precomputed: bool = True):
-        # TODO: load pre-computed Fourier encodings
+    def __init__(self, order: int = 3, load_precomputed: bool = True):
         print('No noise model for Pokusaeva data.')
         d = np.load('/home/clarafy/waterslides/FitnessSparsity/results/his3p_big_data.npy', allow_pickle=True).item()
         intseqs, yorig_n = d['seq'], np.array(d['y'])
@@ -162,6 +164,8 @@ class PokusaevaData(Assay):
         else:
             print("Computing encoding up to order {}.".format(order))
             self.X_nxp = util.fourier_from_seqs(intseqs, self.alphabet_szs, order=order)
+            np.savez('/home/clarafy/waterslides/calibrating-design/pokusaeva/pokusaeva_order{}.npz'.format(order),
+                     X_nxp=self.X_nxp)
 
 
     def get_measurements(self, x_idx: np.array, seed: int = None):
