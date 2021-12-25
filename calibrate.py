@@ -22,7 +22,7 @@ def get_uniform_train_and_design_test(data, n_train, gamma, lmbda, seed: int = N
     Z = np.sum(punnorm_n)
 
     # draw test covariate
-    test_idx = rng.choice(data.n, 1, p=punnorm_n / Z if lmbda > 0 else None)
+    test_idx = rng.choice(data.n, 1, p=punnorm_n / Z)
     ytest_1 = data.get_measurements(test_idx)
     Xtest_1xp = data.X_nxp[test_idx]
     pred_1 = Xtest_1xp.dot(beta_p)
@@ -141,6 +141,7 @@ class ConformalRidge(ABC):
             ab_nx2[i] = ai, bi
             C_nxp[i] = Ci
             An_nxp[i] = Ai[:, -1]
+
 
 
         # LOO score for i = n + 1
