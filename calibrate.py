@@ -1,3 +1,14 @@
+"""
+Classes for full conformal prediction for exchangeable data and data under standard and feedback covariate shift,
+both for black-box predictive models and computationally optimized for ridge regression.
+Throughout this file, variable name suffixes denote the shape of the numpy array, where
+    n: number of training points
+    n1: n + 1
+    p: number of features
+    y: number of candidate labels, |Y|
+    u: number of sequences in domain, |X|
+"""
+
 import numpy as np
 import time
 import scipy as sc
@@ -6,44 +17,53 @@ from abc import ABC, abstractmethod
 
 # ========== conformal utilities ==========
 
-def get_uniform_train_and_design_test(data, n_train, gamma, lmbda, seed: int = None):
+def get_training_and_designed_data(data, n, gamma, lmbda, seed: int = None):
+    """
+    Sample training data uniformly at random from combinatorially complete data set (Poelwijk et al. 2019),
+    and sample one designed protein (w/ ground-truth label) according to design algorithm in Eq. 6 of main paper.
+
+    :param data: assay.PoelwijkData object
+    :param n: int, number of training points, {96, 192, 384} in main paper
+    :param gamma: float, ridge regularization strength
+    :param lmbda: float, inverse temperature of design algorithm in Eq. 6, {0, 2, 4, 6} in main paper
+    :param seed: int, random seed
+    :return: numpy arrays of training sequences, training labels, designed sequence, label, and prediction
+    """
+
     # get random training data
     rng = np.random.default_rng(seed)
-    train_idx = rng.choice(data.n, n_train, replace=True)
-    Xtrain_nxp, ytrain_n = data.X_nxp[train_idx], data.get_measurements(train_idx)
+    train_idx = rng.choice(data.n, n, replace=True)
+    Xtrain_nxp, ytrain_n = data.X_nxp[train_idx], data.get_measurements(train_idx)  # get noisy measurements
 
-    # train model
+    # train ridge regression model
     A_pxn = get_invcov_dot_xt(Xtrain_nxp, gamma, use_lapack=True)
     beta_p = A_pxn.dot(ytrain_n)
 
-    # construct test covariate distribution
+    # construct test input distribution \tilde{p}_{X; Z_{1:n}}
     predall_n = data.X_nxp.dot(beta_p)
     punnorm_n = np.exp(lmbda * predall_n)
     Z = np.sum(punnorm_n)
 
-    # draw test covariate
+    # draw test input (index of designed sequence)
     test_idx = rng.choice(data.n, 1, p=punnorm_n / Z if lmbda else None)
-
-    ytest_1 = data.get_measurements(test_idx)
     Xtest_1xp = data.X_nxp[test_idx]
+
+    # get noisy measurement and model prediction for designed sequence
+    ytest_1 = data.get_measurements(test_idx)
     pred_1 = Xtest_1xp.dot(beta_p)
     return Xtrain_nxp, ytrain_n, Xtest_1xp, ytest_1, pred_1
 
-def get_wt_centered_train_data(wt_is_1, n_sample, p_mutate, seed: int = None):
-    np.random.seed(seed)
-    X_nxp = sc.stats.bernoulli.rvs(1 - p_mutate if wt_is_1 else p_mutate, size=(n_sample, 13))
-    X_nxp[X_nxp == 0] = -1
-
-    def ptrain_fn(Xtest_nxp):
-        nzero_n = np.sum(Xtest_nxp[:, 1 : 14] < 0, axis=1)
-        none_n = 13 - nzero_n
-        pmut_n = np.power(p_mutate, nzero_n if wt_is_1 else none_n)
-        pwt_n = np.power(1 - p_mutate, none_n if wt_is_1 else nzero_n)
-        return pmut_n * pwt_n
-
-    return X_nxp, ptrain_fn
-
 def weighted_quantile(vals_n, weights_n, quantile, tol: float = 1e-12):
+    """
+    Compute the quantile of weighted scores.
+
+    :param vals_n: (n,) numpy array
+    :param weights_n: (n,) numpy array
+    :param quantile: float
+    :param tol: float
+    :return: weighted quantile, float
+    """
+
     if np.abs(np.sum(weights_n) - 1) > tol:
         raise ValueError("weights don't sum to one.")
     if vals_n.size != weights_n.size:
@@ -59,16 +79,32 @@ def weighted_quantile(vals_n, weights_n, quantile, tol: float = 1e-12):
     return vals_n[idx]
 
 def get_quantile(alpha, w_n1xy, scores_n1xy):
+    """
+    Compute the quantile of weighted scores for each candidate label y
+
+    :param alpha: float, miscoverage level
+    :param w_n1xy: (n + 1, |Y|) numpy array of weights (unnormalized)
+    :param scores_n1xy: (n + 1, |Y|) numpy array of scores
+    :return: (|Y|,) numpy array of quantiles
+    """
     if w_n1xy.ndim == 1:
         w_n1xy = w_n1xy[:, None]
         scores_n1xy = scores_n1xy[:, None]
     p_n1xy = w_n1xy / np.sum(w_n1xy, axis=0)
-    augscore_n1xy = np.vstack([scores_n1xy[: -1], np.inf * np.ones([scores_n1xy.shape[1]])])
-    q_y = np.array([weighted_quantile(augscore_n1, p_n1, 1 - alpha) for augscore_n1, p_n1 in zip(augscore_n1xy.T, p_n1xy.T)])
+    q_y = np.array([weighted_quantile(score_n1, p_n1, 1 - alpha) for score_n1, p_n1 in zip(scores_n1xy.T, p_n1xy.T)])
     return q_y
 
-def is_covered(y, cs, y_increment):
-    return np.any(np.abs(y - cs) < (y_increment / 2))
+def is_covered(y, confset, y_increment):
+    """
+    Return if confidence set covers true label
+
+    :param y: true label
+    :param confset: numpy array of values in confidence set
+    :param y_increment: float, \Delta increment between candidate label values, 0.01 in main paper
+    :return: bool
+    """
+    return np.any(np.abs(y - confset) < (y_increment / 2))
+
 
 
 
@@ -76,11 +112,19 @@ def is_covered(y, cs, y_increment):
 # ========== ridge regression calibration ==========
 
 def get_invcov_dot_xt(X_nxp, gamma, use_lapack: bool = True):
+    """
+    Compute (X^TX + \gamma I)^{-1} X^T
+
+    :param X_nxp: (n, p) numpy array encoding sequences
+    :param gamma: float, ridge regularization strength
+    :param use_lapack: bool, whether or not to use low-level LAPACK functions for inverting covariance (fastest)
+    :return: (p, n) numpy array, (X^TX + \gamma I)^{-1} X^T
+    """
     reg_pxp = gamma * np.eye(X_nxp.shape[1])
     reg_pxp[0, 0] = 0  # don't penalize intercept term
     cov_pxp = X_nxp.T.dot(X_nxp) + reg_pxp
     if use_lapack:
-        # fastest way to invert PD matrices, but no robust error-checking
+        # fastest way to invert PD matrices from
         # https://stackoverflow.com/questions/40703042/more-efficient-way-to-invert-a-matrix-knowing-it-is-symmetric-and-positive-semi
         zz, _ = sc.linalg.lapack.dpotrf(cov_pxp, False, False)
         invcovtri_pxp, info = sc.linalg.lapack.dpotri(zz)
@@ -92,7 +136,18 @@ def get_invcov_dot_xt(X_nxp, gamma, use_lapack: bool = True):
 
 
 class ConformalRidge(ABC):
+    """
+    Abstract base class for full conformal with computations optimized for ridge regression.
+    """
     def __init__(self, ptrain_fn, ys, Xuniv_uxp, gamma, use_lapack: bool = True):
+        """
+        :param ptrain_fn: function that outputs likelihood of input under training input distribution, p_X
+        :param ys: numpy array of candidate labels
+        :param Xuniv_uxp: (u, p) numpy array encoding all sequences in domain (e.g., all 2^13 sequences
+            in Poelwijk et al. 2019 data set), needed for computing normalizing constant
+        :param gamma: float, ridge regularization strength
+        :param use_lapack: bool, whether or not to use low-level LAPACK functions for inverting covariance (fastest)
+        """
         self.ptrain_fn = ptrain_fn
         self.Xuniv_uxp = Xuniv_uxp
         self.p = Xuniv_uxp.shape[1]
@@ -106,7 +161,14 @@ class ConformalRidge(ABC):
         Z = np.sum(np.exp(lmbda * predall_u))
         return Z
 
-    def get_insample_scores(self, Xaug_n1xp, ytrain_n, use_adaptive_score: bool = False):
+    def get_insample_scores(self, Xaug_n1xp, ytrain_n):
+        """
+        Compute in-sample scores, i.e. residuals using model trained on all n + 1 data points (instead of LOO data)
+
+        :param Xaug_n1xp: (n + 1, p) numpy array encoding all n + 1 sequences (training + candidate test point)
+        :param ytrain_n: (n,) numpy array of true labels for the n training points
+        :return: (n + 1, |Y|) numpy array of scores
+        """
         A = get_invcov_dot_xt(Xaug_n1xp, self.gamma, use_lapack=self.use_lapack)
         C = A[:, : -1].dot(ytrain_n)  # p elements
         a_n1 = C.dot(Xaug_n1xp.T)
@@ -118,12 +180,20 @@ class ConformalRidge(ABC):
         muhatiy_n1xy = a_n1[:, None] + by_n1xy
         scoresis_n1xy[: -1] = np.abs(ytrain_n[:, None] - muhatiy_n1xy[: -1])
         scoresis_n1xy[-1] = np.abs(self.ys - muhatiy_n1xy[-1])
-        if use_adaptive_score:
-            scoresis_n1xy /= np.exp(muhatiy_n1xy)
         return scoresis_n1xy
 
-    def compute_loo_scores_and_lrs(self, Xaug_n1xp, ytrain_n, lmbda,
-                                   compute_lrs: bool = True, use_adaptive_score: bool = False):
+    def compute_loo_scores_and_lrs(self, Xaug_n1xp, ytrain_n, lmbda, compute_lrs: bool = True):
+        """
+        Compute LOO scores, i.e. residuals using model trained on n data points (training + candidate test points,
+        but leave i-th training point out).
+
+        :param Xaug_n1xp: (n + 1, p) numpy array encoding all n + 1 sequences (training + candidate test point)
+        :param ytrain_n: (n,) numpy array of true labels for the n training points
+        :param lmbda: float, inverse temperature of design algorithm in Eq. 6, {0, 2, 4, 6} in main paper
+        :param compute_lrs: bool: whether or not to compute likelihood ratios (this part takes the longest,
+            so set to False if only want to compute scores)
+        :return: (n + 1, |Y|) numpy arrays of scores S_i(X_test, y) and weights w_i^y(X_test) in Eq. 3 in main paper
+        """
         # fit n + 1 LOO models and store linear parameterizations of \mu_{-i, y}(X_i) as function of y
         n = ytrain_n.size
         ab_nx2 = np.zeros([n, 2])
@@ -156,14 +226,12 @@ class ConformalRidge(ABC):
         prediy_nxy = ab_nx2[:, 0][:, None] + by_nxy
         scoresloo_n1xy[: -1] = np.abs(ytrain_n[:, None] - prediy_nxy)
         scoresloo_n1xy[-1] = np.abs(self.ys - alast)
-        if use_adaptive_score:
-            scoresloo_n1xy[: -1] /= np.exp(prediy_nxy)
-            scoresloo_n1xy[-1] /= np.exp(alast)
 
-        w_n1xy = None
         # likelihood ratios for each candidate value y
+        w_n1xy = None
         if compute_lrs:
             betaiy_nxpxy = C_nxp[:, :, None] + self.ys * An_nxp[:, :, None]
+            # compute normalizing constant in Eq. 6 in main paper
             pred_nxyxu = np.tensordot(betaiy_nxpxy, self.Xuniv_uxp, axes=(1, 1))
             normconst_nxy = np.sum(np.exp(lmbda * pred_nxyxu), axis=2)
             ptrain_n = self.ptrain_fn(Xaug_n1xp[: -1])
@@ -181,8 +249,7 @@ class ConformalRidge(ABC):
     def get_loo_scores_and_lrs(self, Xaug_n1xp, ytrain_n, lmbda):
         pass
 
-    def get_confidence_set(self, Xtrain_nxp, ytrain_n, Xtest_1xp, lmbda,
-                           use_adaptive_score: bool = False, alpha: float = 0.1):
+    def get_confidence_set(self, Xtrain_nxp, ytrain_n, Xtest_1xp, lmbda, alpha: float = 0.1, use_is_scores: bool = False):
         if (self.p != Xtrain_nxp.shape[1]):
             raise ValueError('Feature dimension {} differs from provided Xuniv_uxp {}'.format(
                 Xtrain_nxp.shape[1], self.Xuniv_uxp.shape))
@@ -191,11 +258,10 @@ class ConformalRidge(ABC):
         # ===== compute scores and weights =====
 
         # compute in-sample scores
-        scoresis_n1xy = self.get_insample_scores(Xaug_n1xp, ytrain_n, use_adaptive_score=use_adaptive_score)
+        scoresis_n1xy = self.get_insample_scores(Xaug_n1xp, ytrain_n) if use_is_scores else None
 
         # compute LOO scores and likelihood ratios
-        scoresloo_n1xy, w_n1xy = self.get_loo_scores_and_lrs(
-            Xaug_n1xp, ytrain_n, lmbda, use_adaptive_score=use_adaptive_score)
+        scoresloo_n1xy, w_n1xy = self.get_loo_scores_and_lrs(Xaug_n1xp, ytrain_n, lmbda)
 
         # ===== construct confidence sets =====
 
@@ -204,35 +270,43 @@ class ConformalRidge(ABC):
         loo_cs = self.ys[scoresloo_n1xy[-1] <= looq_y]
 
         # based on in-sample score
-        isq_y = get_quantile(alpha, w_n1xy, scoresis_n1xy)
-        is_cs = self.ys[scoresis_n1xy[-1] <= isq_y]
+        is_cs = None
+        if use_is_scores:
+            isq_y = get_quantile(alpha, w_n1xy, scoresis_n1xy)
+            is_cs = self.ys[scoresis_n1xy[-1] <= isq_y]
         return loo_cs, is_cs
 
 
-
-class ConformalRidgeNaive(ConformalRidge):
+class ConformalRidgeExchangeable(ConformalRidge):
+    """
+    Class for full conformal with ridge regression, assuming exchangeable data.
+    """
     def __init__(self, ptrain_fn, ys, Xuniv_uxp, gamma, use_lapack: bool = True):
         super().__init__(ptrain_fn, ys, Xuniv_uxp, gamma, use_lapack=use_lapack)
 
-    def get_loo_scores_and_lrs(self, Xaug_n1xp, ytrain_n, lmbda, use_adaptive_score: bool = False):
-        scoresloo_n1xy, _ = self.compute_loo_scores_and_lrs(
-            Xaug_n1xp, ytrain_n, lmbda, compute_lrs=False, use_adaptive_score=use_adaptive_score)
+    def get_loo_scores_and_lrs(self, Xaug_n1xp, ytrain_n, lmbda):
+        scoresloo_n1xy, _ = self.compute_loo_scores_and_lrs(Xaug_n1xp, ytrain_n, lmbda, compute_lrs=False)
+        # for exchangeble data, equal weights on all data points (no need to compute likelihood ratios in line above)
         w_n1xy = np.ones([Xaug_n1xp.shape[0], self.n_y])
         return scoresloo_n1xy, w_n1xy
 
 
-class ConformalRidgeCovariateIntervention(ConformalRidge):
+class ConformalRidgeFeedbackCovariateShift(ConformalRidge):
+    """
+    Class for full conformal with ridge regression under feedback covariate shift via Eq. 6 in main paper.
+    """
     def __init__(self, ptrain_fn, ys, Xuniv_uxp, gamma, use_lapack: bool = True):
         super().__init__(ptrain_fn, ys, Xuniv_uxp, gamma, use_lapack=use_lapack)
 
-    def get_loo_scores_and_lrs(self, Xaug_n1xp, ytrain_n, lmbda, use_adaptive_score: bool = False):
-        scoresloo_n1xy, w_n1xy = self.compute_loo_scores_and_lrs(
-            Xaug_n1xp, ytrain_n, lmbda, compute_lrs=True, use_adaptive_score=use_adaptive_score)
+    def get_loo_scores_and_lrs(self, Xaug_n1xp, ytrain_n, lmbda):
+        scoresloo_n1xy, w_n1xy = self.compute_loo_scores_and_lrs(Xaug_n1xp, ytrain_n, lmbda, compute_lrs=True)
         return scoresloo_n1xy, w_n1xy
 
 
-
-class ConformalRidgeCovariateShift(ConformalRidge):
+class ConformalRidgeStandardCovariateShift(ConformalRidge):
+    """
+    Class for full conformal with ridge regression under standard covariate shift.
+    """
     def __init__(self, ptrain_fn, ys, Xuniv_uxp, gamma, use_lapack: bool = True):
         super().__init__(ptrain_fn, ys, Xuniv_uxp, gamma, use_lapack=use_lapack)
 
@@ -250,10 +324,9 @@ class ConformalRidgeCovariateShift(ConformalRidge):
         w_n1 = ptest_n1 / self.ptrain_fn(Xaug_n1xp)
         return w_n1
 
-    def get_loo_scores_and_lrs(self, Xaug_n1xp, ytrain_n, lmbda, use_adaptive_score: bool = False):
+    def get_loo_scores_and_lrs(self, Xaug_n1xp, ytrain_n, lmbda):
         # LOO scores
-        scoresloo_n1xy, _ = self.compute_loo_scores_and_lrs(
-            Xaug_n1xp, ytrain_n, lmbda, compute_lrs=False, use_adaptive_score=use_adaptive_score)
+        scoresloo_n1xy, _ = self.compute_loo_scores_and_lrs(Xaug_n1xp, ytrain_n, lmbda, compute_lrs=False)
 
         # compute likelihood ratios
         w_n1 = self.get_lrs(Xaug_n1xp, ytrain_n, lmbda)
@@ -262,9 +335,11 @@ class ConformalRidgeCovariateShift(ConformalRidge):
 
 
 
-# ========== model-agnostic calibration ==========
 
-def get_scores(model, Xaug_nxp, yaug_n, use_loo_score: bool = False, use_adaptive_score: bool = False):
+
+# ========== full conformal with black-box model ==========
+
+def get_scores(model, Xaug_nxp, yaug_n, use_loo_score: bool = False):
     if use_loo_score:
         n1 = yaug_n.size  # n + 1
         scores_n1 = np.zeros([n1])
@@ -277,19 +352,26 @@ def get_scores(model, Xaug_nxp, yaug_n, use_loo_score: bool = False, use_adaptiv
             model.fit(Xtrain_nxp, ytrain_n)
             pred_1 = model.predict(Xaug_nxp[i][None, :])
             scores_n1[i] = np.abs(yaug_n[i] - pred_1[0])
-            if use_adaptive_score:
-                scores_n1[i] /= np.exp(pred_1[0])
 
     else:  # in-sample score
         model.fit(Xaug_nxp, yaug_n)
         pred_n1 = model.predict(Xaug_nxp)
         scores_n1 = np.abs(yaug_n - pred_n1)
-        if use_adaptive_score:
-            scores_n1 /= np.exp(pred_n1)
     return scores_n1
 
+
 class Conformal(ABC):
+    """
+    Abstract base class for full conformal with black-box predictive model.
+    """
     def __init__(self, model, ptrain_fn, ys, Xuniv_uxp):
+        """
+        :param model: object with predict() method
+        :param ptrain_fn: function that outputs likelihood of input under training input distribution, p_X
+        :param ys: (|Y|,) numpy array of candidate labels
+        :param Xuniv_uxp: (u, p) numpy array encoding all sequences in domain (e.g., all 2^13 sequences
+            in Poelwijk et al. 2019 data set), needed for computing normalizing constant
+        """
         self.model = model
         self.ptrain_fn = ptrain_fn
         self.ys = ys
@@ -302,8 +384,7 @@ class Conformal(ABC):
         pass
 
     def get_confidence_set(self, Xtrain_nxp, ytrain_n, Xtest_1xp, lmbda,
-                           use_loo_score: bool = True, use_adaptive_score: bool = False, alpha: float = 0.1,
-                           print_every: int = 10, verbose: bool = True):
+                           use_loo_score: bool = True, alpha: float = 0.1, print_every: int = 10, verbose: bool = True):
         if (self.p != Xtrain_nxp.shape[1]):
             raise ValueError('Feature dimension {} differs from provided Xuniv_uxp {}'.format(
                 Xtrain_nxp.shape[1], self.Xuniv_uxp.shape))
@@ -319,8 +400,7 @@ class Conformal(ABC):
 
             # get scores
             yaug_n1 = np.hstack([ytrain_n, y])
-            scores_n1 = get_scores(self.model, Xaug_n1xp, yaug_n1,
-                                   use_loo_score=use_loo_score, use_adaptive_score=use_adaptive_score)
+            scores_n1 = get_scores(self.model, Xaug_n1xp, yaug_n1, use_loo_score=use_loo_score)
             scores_n1xy[:, y_idx] = scores_n1
 
             # get likelihood ratios
@@ -340,7 +420,11 @@ class Conformal(ABC):
                     y_idx + 1, self.ys.size, time.time() - t0))
         return np.array(cs), scores_n1xy, w_n1xy
 
-class ConformalNaive(Conformal):
+
+class ConformalExchangeable(Conformal):
+    """
+    Full conformal with black-box predictive model, assuming exchangeable data.
+    """
     def __init__(self, model, ptrain_fn, ys, Xuniv_uxp):
         super().__init__(model, ptrain_fn, ys, Xuniv_uxp)
 
@@ -348,8 +432,10 @@ class ConformalNaive(Conformal):
         return np.ones([Xaug_n1xp.shape[0]])
 
 
-
-class ConformalCovariateIntervention(Conformal):
+class ConformalFeedbackCovariateShift(Conformal):
+    """
+    Full conformal with black-box predictive model under feedback covariate shift via Eq. 6 in main paper.
+    """
     def __init__(self, model, ptrain_fn, ys, Xuniv_uxp):
         super().__init__(model, ptrain_fn, ys, Xuniv_uxp)
 
@@ -374,7 +460,10 @@ class ConformalCovariateIntervention(Conformal):
         return w_n1
 
 
-class ConformalCovariateShift(Conformal):
+class ConformalStandardCovariateShift(Conformal):
+    """
+    Full conformal with black-box predictive model under standard covariate shift.
+    """
     def __init__(self, model, ptrain_fn, ys, Xuniv_uxp):
         super().__init__(model, ptrain_fn, ys, Xuniv_uxp)
 
