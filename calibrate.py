@@ -22,7 +22,8 @@ def get_uniform_train_and_design_test(data, n_train, gamma, lmbda, seed: int = N
     Z = np.sum(punnorm_n)
 
     # draw test covariate
-    test_idx = rng.choice(data.n, 1, p=punnorm_n / Z)
+    test_idx = rng.choice(data.n, 1, p=punnorm_n / Z if lmbda else None)
+
     ytest_1 = data.get_measurements(test_idx)
     Xtest_1xp = data.X_nxp[test_idx]
     pred_1 = Xtest_1xp.dot(beta_p)
@@ -45,6 +46,8 @@ def get_wt_centered_train_data(wt_is_1, n_sample, p_mutate, seed: int = None):
 def weighted_quantile(vals_n, weights_n, quantile, tol: float = 1e-12):
     if np.abs(np.sum(weights_n) - 1) > tol:
         raise ValueError("weights don't sum to one.")
+    if vals_n.size != weights_n.size:
+        raise ValueError("vals_n size {}, weights_n size {}".format(vals_n.size, weights_n.size))
 
     # sort values
     sorter = np.argsort(vals_n)
@@ -142,8 +145,6 @@ class ConformalRidge(ABC):
             C_nxp[i] = Ci
             An_nxp[i] = Ai[:, -1]
 
-
-
         # LOO score for i = n + 1
         tmp = get_invcov_dot_xt(Xaug_n1xp[: -1], self.gamma, use_lapack=self.use_lapack)
         beta_p = tmp.dot(ytrain_n)
@@ -206,6 +207,8 @@ class ConformalRidge(ABC):
         isq_y = get_quantile(alpha, w_n1xy, scoresis_n1xy)
         is_cs = self.ys[scoresis_n1xy[-1] <= isq_y]
         return loo_cs, is_cs
+
+
 
 class ConformalRidgeNaive(ConformalRidge):
     def __init__(self, ptrain_fn, ys, Xuniv_uxp, gamma, use_lapack: bool = True):

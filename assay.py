@@ -105,7 +105,8 @@ class PoelwijkData(Assay):
     def get_measurements(self, x_idx: np.array, seed: int = None):
         # given indices of sequences to measure, returns noisy measurements
         np.random.seed(seed)
-        return np.array([np.random.normal(loc=self.y_n[i], scale=self.noise_scale * self.se_n[i]) for i in x_idx])
+        noisy = np.array([np.random.normal(loc=self.y_n[i], scale=self.noise_scale * self.se_n[i]) for i in x_idx])
+        return np.fmax(noisy, 0)
 
 # print('Only loading assayed Wu data, not imputed data.')
 # intseqs, countin_n, countout_n, yorig_n = self.read_wu_supp1()

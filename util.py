@@ -1,5 +1,6 @@
 import numpy as np
 import scipy as sc
+import time
 
 from tqdm import tqdm
 from itertools import chain, combinations
@@ -20,10 +21,11 @@ def plot_predictions(y_n, pred_n, title: str = None, **kwargs):
     plt.title(title)
 
 def train_and_evaluate(n_train, model, X_nxp, y_n, n_trial: int = 100, plot_representative: bool = False,
-                      title: str = None, record_reg: bool = True, plot_xy_line: bool = False, **kwargs):
+                      title: str = None, record_reg: bool = True, print_progress: int = 0, plot_xy_line: bool = False, **kwargs):
     metrics_sx3 = np.zeros([n_trial, 3])
     pred_sxn = np.zeros([n_trial, y_n.size - n_train])
     reg_s = np.nan * np.ones([n_trial])
+    t0 = time.time()
     for seed in range(n_trial):
         np.random.seed(seed)
         shuffle_idx = np.random.permutation(y_n.size)
@@ -32,8 +34,12 @@ def train_and_evaluate(n_train, model, X_nxp, y_n, n_trial: int = 100, plot_repr
         pred_n, rmse, rho, p_rho, r, p_r = evaluate(model, X_nxp[test_idx], y_n[test_idx], plot=False)
         pred_sxn[seed] = pred_n
         metrics_sx3[seed] = rmse, rho, r
+        # print(model.kernel_)
         if record_reg:
             reg_s[seed] = model.alpha_
+
+        if print_progress > 0 and (seed + 1) % print_progress == 0:
+            print("Done with {} trials. {:.1f}".format(seed + 1, time.time() - t0))
 
     if plot_representative:
         plot_seed = np.argmin(np.abs(metrics_sx3[:, 0] - np.mean(metrics_sx3[:, 0])))
