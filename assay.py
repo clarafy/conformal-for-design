@@ -9,7 +9,151 @@ import pandas as pd
 from sklearn.linear_model import LinearRegression
 
 
-# ===== utilities for Walsh-Hadamard transform =====
+from tensorflow.keras.utils import Sequence
+
+# ===== utilities and classes for AAV experiments =====
+
+# ----- utilities for converting between amino acids and nucleotides -----
+
+AA2CODON = {
+        'l': ['tta', 'ttg', 'ctt', 'ctc', 'cta', 'ctg'],
+        's': ['tct', 'tcc', 'tca', 'tcg', 'agt', 'agc'],
+        'r': ['cgt', 'cgc', 'cga', 'cgg', 'aga', 'agg'],
+        'v': ['gtt', 'gtc', 'gta', 'gtg'],
+        'a': ['gct', 'gcc', 'gca', 'gcg'],
+        'p': ['cct', 'ccc', 'cca', 'ccg'],
+        't': ['act', 'acc', 'aca', 'acg'],
+        'g': ['ggt', 'ggc', 'gga', 'ggg'],
+        '*': ['taa', 'tag', 'tga'],
+        'i': ['att', 'atc', 'ata'],
+        'y': ['tat', 'tac'],
+        'f': ['ttt', 'ttc'],
+        'c': ['tgt', 'tgc'],
+        'h': ['cat', 'cac'],
+        'q': ['caa', 'cag'],
+        'n': ['aat', 'aac'],
+        'k': ['aaa', 'aag'],
+        'd': ['gat', 'gac'],
+        'e': ['gaa', 'gag'],
+        'w': ['tgg'],
+        'm': ['atg']
+    }
+
+
+NUC_ORDERED = ['A', 'T', 'C', 'G']
+NUC2IDX = {nuc: i for i, nuc in enumerate(NUC_ORDERED)}
+
+AA_ORDERED = [k.upper() for k in AA2CODON.keys()]
+AA2IDX = {aa: i for i, aa in enumerate(AA_ORDERED)}
+
+def pnuc2paa(pnuc_Lxk):
+    """
+    Converts nucleotide probabilities to amino acid probabilities.
+    """
+    L = pnuc_Lxk.shape[0]
+    paadf_kxL = pd.DataFrame(0., index=AA_ORDERED, columns=range(int(L / 3)))
+    for i in range(int(L / 3)):
+        for aa in AA_ORDERED:
+            codons = AA2CODON[aa.lower()]
+            # for each codon corresponding to the AA, compute probability of generating that codon
+            for cod in codons:
+                p_cod = 1
+                for j in range(3): # multiply probabilities of each of the 3 nucleotides in the codon
+                    nuc_idx = NUC2IDX[cod[j].upper()]
+                    p_cod *= pnuc_Lxk[i * 3 + j, nuc_idx]
+                paadf_kxL[i].loc[aa] += p_cod
+    return np.array(paadf_kxL).T
+
+def phinuc2paa(phinuc_Lxk):
+    """
+    Converts unnormalized nucleotide probabilities to amino acid probabilities.
+    """
+    # normalize probabilities of categorical distribution per site
+    pnuc_Lxk = np.exp(phinuc_Lxk) / np.sum(np.exp(phinuc_Lxk), axis=1, keepdims=True)
+    # convert nucleotide probabilities to amino acid probabilities
+    paa_Lxk = np.array(pnuc2paa(pnuc_Lxk))
+    return paa_Lxk
+
+# NNK categorical distribution
+pnnknucpersite = np.array([[0.25, 0.25, 0.25, 0.25], [0.25, 0.25, 0.25, 0.25], [0, 0.5, 0, 0.5]])
+pnnknuc_Lxk = np.tile(pnnknucpersite, [7, 1])
+PNNKAA_LXK = np.array(pnuc2paa(pnnknuc_Lxk))
+
+# ----- rejection sampling from test distribution -----
+
+def get_loglikelihood(seq_n, p_Lxk: np.array):
+    ohe_nxLxk = np.stack([one_hot_encode(seq, flatten=False) for seq in seq_n])
+    logp_1xLxk = np.log(p_Lxk)[None, :, :]
+    logp_n = np.sum(ohe_nxLxk * logp_1xLxk, axis=(1, 2))
+    return logp_n
+
+def get_rejection_sampling_acceptance_probabilities(seq_n, phitestnuc_Lxk, logptrain_n):
+    ptestaa_Lxk = phinuc2paa(phitestnuc_Lxk)
+    ratio_Lxk = ptestaa_Lxk / PNNKAA_LXK
+    maxp_l = np.max(ratio_Lxk, axis=1)
+    M = np.prod(maxp_l)
+
+    # compute test likelihoods of all data
+    logptest_n = get_loglikelihood(seq_n, ptestaa_Lxk)
+    paccept_n = np.exp(logptest_n - (np.log(M) + logptrain_n))
+    return paccept_n, logptest_n
+
+def rejection_sample_from_test_distribution(paccept_n):
+    nonzero_samples_from_test = False
+    while not nonzero_samples_from_test:
+        accept_n = sc.stats.bernoulli.rvs(paccept_n)
+        testsamp_idx = np.where(accept_n)[0]
+        n_test = testsamp_idx.size
+        if n_test:
+            nonzero_samples_from_test = True
+    return testsamp_idx
+
+# ----- class for sequence-fitness data generation -----
+
+def one_hot_encode(seq, flatten: bool = True):
+    l = len(seq)
+    ohe_lxk = np.zeros((l, len(AA_ORDERED)))
+    ones_idx = (range(l), [AA2IDX[seq[i]] for i in range(l)])
+    ohe_lxk[ones_idx] = 1
+    return ohe_lxk.flatten() if flatten else ohe_lxk
+
+class DataGenerator(Sequence):
+    def __init__(self, seq_n, enrichment_nx2 = None, ids = None, batch_size: int = 1000, shuffle: bool = True):
+        self.seq_n = seq_n
+        # (estimates of) mean and variance log enrichment score (dummy values if using for prediction)
+        self.enrichment_nx2 = enrichment_nx2 if enrichment_nx2 is not None else np.zeros([len(seq_n), 2])
+        self.ids = ids if ids is not None else range(len(seq_n))
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.n_feat = len(self.seq_n[0]) * len(AA_ORDERED)
+        self.on_epoch_end()
+
+    def on_epoch_end(self):
+        """
+        Update indices after each epoch.
+        """
+        self.idx = np.arange(len(self.ids))
+        if self.shuffle:
+            np.random.shuffle(self.idx)
+
+    def __len__(self):
+        return int(np.floor(len(self.ids) / self.batch_size))
+
+    def __getitem__(self, index):
+        # generate indices of the batch
+        idx = self.idx[index * self.batch_size : (index + 1) * self.batch_size]
+
+        # find list of IDs
+        ids = [self.ids[k] for k in idx]
+
+        # fetch sequences and their enrichment mean and variance
+        X_bxp = np.array([one_hot_encode(self.seq_n[idx], flatten=True) for idx in ids])
+        y_nx2 = self.enrichment_nx2[ids]
+        return [X_bxp, y_nx2[:, 0], y_nx2[:, 1]]
+
+# ===== utilities and classes for fluorescence experiments =====
+
+# ----- utilities for Walsh-Hadamard transform -----
 # adapted from David H. Brookes's code (https://github.com/dhbrookes/FitnessSparsity/blob/main/src/utils.py) for:
 # D. H. Brookes, A. Aghazadeh, J. Listgarten,
 # On the sparsity of fitness functions and implications for learning. PNAS, 119 (2022).
@@ -42,8 +186,7 @@ def walsh_hadamard_from_seqs(signedseq_nxl: np.array, order: int = None, normali
         X_nxp /= np.sqrt(np.power(2, seq_len))  # for proper WH matrix
     return X_nxp
 
-
-# ===== classes for handling combinatorially complete data sets =====
+# ----- classes for handling combinatorially complete data sets -----
 
 class Assay(ABC):
     def __init__(self):

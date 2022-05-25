@@ -15,8 +15,17 @@ import scipy as sc
 
 from abc import ABC, abstractmethod
 
+# ===== split conformal for AAV experiments =====
+
+def get_split_coverage(lq_nx2, fit_n):
+    cov = np.sum((fit_n >= lq_nx2[:, 0]) & (fit_n <= lq_nx2[:, 1])) / fit_n.size
+    return cov
+
+
+
 # ========== conformal utilities ==========
 
+# TODO: move to assay.py?
 def get_training_and_designed_data(data, n, gamma, lmbda, seed: int = None):
     """
     Sample training data uniformly at random from combinatorially complete data set (Poelwijk et al. 2019),
