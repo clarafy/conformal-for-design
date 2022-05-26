@@ -2,11 +2,12 @@
 Classes for full conformal prediction for exchangeable data and data under standard and feedback covariate shift,
 both for black-box predictive models and computationally optimized for ridge regression.
 Throughout this file, variable name suffixes denote the shape of the numpy array, where
-    n: number of training points
+    n: number of training points, or generic number of data points
     n1: n + 1
     p: number of features
     y: number of candidate labels, |Y|
     u: number of sequences in domain, |X|
+    m: number of held-out calibration points for split conformal
 """
 
 import numpy as np
@@ -15,83 +16,62 @@ import scipy as sc
 
 from abc import ABC, abstractmethod
 
-# ===== split conformal for AAV experiments =====
+# ===== utilities for split conformal =====
 
 def get_split_coverage(lq_nx2, fit_n):
     cov = np.sum((fit_n >= lq_nx2[:, 0]) & (fit_n <= lq_nx2[:, 1])) / fit_n.size
     return cov
 
+def get_coverage_of_randomized_confidence_sets(C_n, y_n):
+    def is_covered(confint_list, y):
+        for confint_2 in confint_list:
+            if y >= confint_2[0] and y <= confint_2[1]:
+                return True
+        return False
+    def get_len_conf_set(confint_list):
+        return np.sum([confint_2[1] - confint_2[0] for confint_2 in confint_list])
+
+    cov_n = np.array([is_covered(confset, y) for confset, y in zip(C_n, y_n)])
+    len_n = np.array([get_len_conf_set(confset) for confset in C_n])
+    return cov_n, len_n
+
+def get_randomized_confidence_set(scores_m, weights_m1, predtest, alpha: float = 0.1):
+    lb_is_set = False
+    idx = np.argsort(scores_m)
+    sortedscores_m1 = np.hstack([0, scores_m[idx]])
+    sortedweights_m1 = np.hstack([0, weights_m1[: -1][idx]])
+    C = []
+    for i in range(sortedscores_m1.size - 1):
+        tmp = np.sum(sortedweights_m1[: i + 1])
+        if tmp + weights_m1[-1] < 1 - alpha:
+            C.append([predtest + sortedscores_m1[i], predtest + sortedscores_m1[i + 1]])
+            C.append([predtest - sortedscores_m1[i + 1], predtest - sortedscores_m1[i]])
+        elif tmp + weights_m1[-1] >= 1 - alpha and tmp < 1 - alpha:
+            if not lb_is_set:
+                lb_is_set = True
+                LF = tmp
+            F = (tmp + weights_m1[-1] - (1 - alpha)) / (tmp + weights_m1[-1] - LF)
+            if sc.stats.bernoulli.rvs(1 - F):
+                C.append([predtest + sortedscores_m1[i], predtest + sortedscores_m1[i + 1]])
+                C.append([predtest - sortedscores_m1[i + 1], predtest - sortedscores_m1[i]])
+    if np.sum(weights_m1[: -1]) < 1 - alpha:
+        if not lb_is_set:
+            LF = np.sum(weights_m1[: -1])
+        F = alpha / (1 - LF)
+        if sc.stats.bernoulli.rvs(1 - F):
+            C.append([predtest + sortedscores_m1[-1], np.inf])
+            C.append([-np.inf, predtest - sortedscores_m1[-1]])
+    return C
 
 
-# ========== conformal utilities ==========
 
-# TODO: move to assay.py?
-def get_training_and_designed_data(data, n, gamma, lmbda, seed: int = None):
-    """
-    Sample training data uniformly at random from combinatorially complete data set (Poelwijk et al. 2019),
-    and sample one designed protein (w/ ground-truth label) according to design algorithm in Eq. 6 of main paper.
+# ========== full conformal utilities ==========
 
-    :param data: assay.PoelwijkData object
-    :param n: int, number of training points, {96, 192, 384} in main paper
-    :param gamma: float, ridge regularization strength
-    :param lmbda: float, inverse temperature of design algorithm in Eq. 6, {0, 2, 4, 6} in main paper
-    :param seed: int, random seed
-    :return: numpy arrays of training sequences, training labels, designed sequence, label, and prediction
-    """
-
-    # get random training data
-    rng = np.random.default_rng(seed)
-    train_idx = rng.choice(data.n, n, replace=True)
-    Xtrain_nxp, ytrain_n = data.X_nxp[train_idx], data.get_measurements(train_idx)  # get noisy measurements
-
-    # train ridge regression model
-    A_pxn = get_invcov_dot_xt(Xtrain_nxp, gamma, use_lapack=True)
-    beta_p = A_pxn.dot(ytrain_n)
-
-    # construct test input distribution \tilde{p}_{X; Z_{1:n}}
-    predall_n = data.X_nxp.dot(beta_p)
-    punnorm_n = np.exp(lmbda * predall_n)
-    Z = np.sum(punnorm_n)
-
-    # draw test input (index of designed sequence)
-    test_idx = rng.choice(data.n, 1, p=punnorm_n / Z if lmbda else None)
-    Xtest_1xp = data.X_nxp[test_idx]
-
-    # get noisy measurement and model prediction for designed sequence
-    ytest_1 = data.get_measurements(test_idx)
-    pred_1 = Xtest_1xp.dot(beta_p)
-    return Xtrain_nxp, ytrain_n, Xtest_1xp, ytest_1, pred_1
-
-def weighted_quantile(vals_n, weights_n, quantile, tol: float = 1e-12):
-    """
-    Compute the quantile of weighted scores.
-
-    :param vals_n: (n,) numpy array
-    :param weights_n: (n,) numpy array
-    :param quantile: float
-    :param tol: float
-    :return: weighted quantile, float
-    """
-
-    if np.abs(np.sum(weights_n) - 1) > tol:
-        raise ValueError("weights don't sum to one.")
-    if vals_n.size != weights_n.size:
-        raise ValueError("vals_n size {}, weights_n size {}".format(vals_n.size, weights_n.size))
-
-    # sort values
-    sorter = np.argsort(vals_n)
-    vals_n = vals_n[sorter]
-    weights_n = weights_n[sorter]
-
-    cumweight_n = np.cumsum(weights_n)
-    idx = np.searchsorted(cumweight_n, quantile, side='left')
-    return vals_n[idx]
-
-def get_quantile(alpha, w_n1xy, scores_n1xy):
+def get_weighted_quantile(quantile, w_n1xy, scores_n1xy):
     """
     Compute the quantile of weighted scores for each candidate label y
 
-    :param alpha: float, miscoverage level
+    :param quantile: float, quantile
     :param w_n1xy: (n + 1, |Y|) numpy array of weights (unnormalized)
     :param scores_n1xy: (n + 1, |Y|) numpy array of scores
     :return: (|Y|,) numpy array of quantiles
@@ -99,8 +79,19 @@ def get_quantile(alpha, w_n1xy, scores_n1xy):
     if w_n1xy.ndim == 1:
         w_n1xy = w_n1xy[:, None]
         scores_n1xy = scores_n1xy[:, None]
+
+    # normalize probabilities
     p_n1xy = w_n1xy / np.sum(w_n1xy, axis=0)
-    q_y = np.array([weighted_quantile(score_n1, p_n1, 1 - alpha) for score_n1, p_n1 in zip(scores_n1xy.T, p_n1xy.T)])
+
+    # sort scores and their weights accordingly
+    sorter_per_y_n1xy = np.argsort(scores_n1xy, axis=0)
+    sortedscores_n1xy = np.take_along_axis(scores_n1xy, sorter_per_y_n1xy, axis=0)
+    sortedp_n1xy = np.take_along_axis(p_n1xy, sorter_per_y_n1xy, axis=0)
+
+    # locate quantiles of weighted scores per y
+    cdf_n1xy = np.cumsum(sortedp_n1xy, axis=0)
+    qidx_y = np.sum(cdf_n1xy < quantile, axis=0)  # equivalent to [np.searchsorted(cdf_n1, q) for cdf_n1 in cdf_n1xy]
+    q_y = sortedscores_n1xy[(qidx_y, range(qidx_y.size))]
     return q_y
 
 def is_covered(y, confset, y_increment):
@@ -116,9 +107,7 @@ def is_covered(y, confset, y_increment):
 
 
 
-
-
-# ========== ridge regression calibration ==========
+# ========== utilities and classes for full conformal with ridge regression ==========
 
 def get_invcov_dot_xt(X_nxp, gamma, use_lapack: bool = True):
     """
@@ -275,13 +264,13 @@ class ConformalRidge(ABC):
         # ===== construct confidence sets =====
 
         # based on LOO score
-        looq_y = get_quantile(alpha, w_n1xy, scoresloo_n1xy)
+        looq_y = get_weighted_quantile(1 - alpha, w_n1xy, scoresloo_n1xy)
         loo_cs = self.ys[scoresloo_n1xy[-1] <= looq_y]
 
         # based on in-sample score
         is_cs = None
         if use_is_scores:
-            isq_y = get_quantile(alpha, w_n1xy, scoresis_n1xy)
+            isq_y = get_weighted_quantile(1 - alpha, w_n1xy, scoresis_n1xy)
             is_cs = self.ys[scoresis_n1xy[-1] <= isq_y]
         return loo_cs, is_cs
 
@@ -344,9 +333,7 @@ class ConformalRidgeStandardCovariateShift(ConformalRidge):
 
 
 
-
-
-# ========== full conformal with black-box model ==========
+# ========== utilities and classes for full conformal with black-box model ==========
 
 def get_scores(model, Xaug_nxp, yaug_n, use_loo_score: bool = False):
     if use_loo_score:
@@ -417,7 +404,7 @@ class Conformal(ABC):
             w_n1xy[:, y_idx] = w_n1
 
             # for each value of inverse temperature lambda, compute quantile of weighted scores
-            q = get_quantile(alpha, w_n1, scores_n1)
+            q = get_weighted_quantile(1 - alpha, w_n1, scores_n1)
 
             # if y <= quantile, include in confidence set
             if scores_n1[-1] <= q:
