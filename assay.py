@@ -7,9 +7,8 @@ import scipy as sc
 import pandas as pd
 
 from sklearn.linear_model import LinearRegression
-
-
 from tensorflow.keras.utils import Sequence
+from calibrate import get_invcov_dot_xt
 
 # ===== utilities and classes for AAV experiments =====
 
@@ -118,10 +117,10 @@ def one_hot_encode(seq, flatten: bool = True):
     return ohe_lxk.flatten() if flatten else ohe_lxk
 
 class DataGenerator(Sequence):
-    def __init__(self, seq_n, enrichment_nx2 = None, ids = None, batch_size: int = 1000, shuffle: bool = True):
+    def __init__(self, seq_n, fitness_nx2 = None, ids = None, batch_size: int = 1000, shuffle: bool = True):
         self.seq_n = seq_n
         # (estimates of) mean and variance log enrichment score (dummy values if using for prediction)
-        self.enrichment_nx2 = enrichment_nx2 if enrichment_nx2 is not None else np.zeros([len(seq_n), 2])
+        self.fitness_nx2 = fitness_nx2 if fitness_nx2 is not None else np.zeros([len(seq_n), 2])
         self.ids = ids if ids is not None else range(len(seq_n))
         self.batch_size = batch_size
         self.shuffle = shuffle
@@ -146,9 +145,9 @@ class DataGenerator(Sequence):
         # find list of IDs
         ids = [self.ids[k] for k in idx]
 
-        # fetch sequences and their enrichment mean and variance
+        # fetch sequences and their (estimated) fitness mean and variance
         X_bxp = np.array([one_hot_encode(self.seq_n[idx], flatten=True) for idx in ids])
-        y_nx2 = self.enrichment_nx2[ids]
+        y_nx2 = self.fitness_nx2[ids]
         return [X_bxp, y_nx2[:, 0], y_nx2[:, 1]]
 
 # ===== utilities and classes for fluorescence experiments =====
@@ -185,6 +184,44 @@ def walsh_hadamard_from_seqs(signedseq_nxl: np.array, order: int = None, normali
     if normalize:
         X_nxp /= np.sqrt(np.power(2, seq_len))  # for proper WH matrix
     return X_nxp
+
+# ----- sample training and designed data according to fluorescence experiments -----
+
+def get_training_and_designed_data(data, n, gamma, lmbda, seed: int = None):
+    """
+    Sample training data uniformly at random from combinatorially complete data set (Poelwijk et al. 2019),
+    and sample one designed protein (w/ ground-truth label) according to design algorithm in Eq. 6 of main paper.
+
+    :param data: assay.PoelwijkData object
+    :param n: int, number of training points, {96, 192, 384} in main paper
+    :param gamma: float, ridge regularization strength
+    :param lmbda: float, inverse temperature of design algorithm in Eq. 6, {0, 2, 4, 6} in main paper
+    :param seed: int, random seed
+    :return: numpy arrays of training sequences, training labels, designed sequence, label, and prediction
+    """
+
+    # get random training data
+    rng = np.random.default_rng(seed)
+    train_idx = rng.choice(data.n, n, replace=True)
+    Xtrain_nxp, ytrain_n = data.X_nxp[train_idx], data.get_measurements(train_idx)  # get noisy measurements
+
+    # train ridge regression model
+    A_pxn = get_invcov_dot_xt(Xtrain_nxp, gamma, use_lapack=True)
+    beta_p = A_pxn.dot(ytrain_n)
+
+    # construct test input distribution \tilde{p}_{X; Z_{1:n}}
+    predall_n = data.X_nxp.dot(beta_p)
+    punnorm_n = np.exp(lmbda * predall_n)
+    Z = np.sum(punnorm_n)
+
+    # draw test input (index of designed sequence)
+    test_idx = rng.choice(data.n, 1, p=punnorm_n / Z if lmbda else None)
+    Xtest_1xp = data.X_nxp[test_idx]
+
+    # get noisy measurement and model prediction for designed sequence
+    ytest_1 = data.get_measurements(test_idx)
+    pred_1 = Xtest_1xp.dot(beta_p)
+    return Xtrain_nxp, ytrain_n, Xtest_1xp, ytest_1, pred_1
 
 # ----- classes for handling combinatorially complete data sets -----
 
@@ -302,6 +339,6 @@ class PoelwijkData(Assay):
         """
         np.random.seed(seed)
         noisy_n = np.array([np.random.normal(loc=self.y_n[i], scale=self.se_n[i]) for i in seqidx_n])
-        # enforce non-negative measurement since enrichment scores are non-negative
+        # enforce non-negative measurement since enrichment scores are always non-negative
         return np.fmax(noisy_n, 0)
 

@@ -7,7 +7,7 @@ Throughout this file, variable name suffixes denote the shape of the numpy array
     p: number of features
     y: number of candidate labels, |Y|
     u: number of sequences in domain, |X|
-    m: number of held-out calibration points for split conformal
+    m: number of held-out calibration points for split conformal methods
 """
 
 import numpy as np
@@ -18,11 +18,24 @@ from abc import ABC, abstractmethod
 
 # ===== utilities for split conformal =====
 
-def get_split_coverage(lq_nx2, fit_n):
-    cov = np.sum((fit_n >= lq_nx2[:, 0]) & (fit_n <= lq_nx2[:, 1])) / fit_n.size
+def get_split_coverage(lu_nx2, y_n):
+    """
+    Computes empirical coverage of split conformal confidence interval
+    :param lu_nx2: (n, 2) numpy array where first and second columns are lower and upper endpoints
+    :param y_n: (n,) numpy array of true labels
+    :return: float, empirical coverage
+    """
+    cov = np.sum((y_n >= lu_nx2[:, 0]) & (y_n <= lu_nx2[:, 1])) / y_n.size
     return cov
 
-def get_coverage_of_randomized_confidence_sets(C_n, y_n):
+def get_randomized_staircase_coverage(C_n, y_n):
+    """
+    Computes empirical coverage and lengths of randomized staircase confidence sets.
+
+    :param C_n: length-n list of outputs of get_randomized_staircase_confidence_set (i.e., list of tuples)
+    :param y_n: (n,) numpy array of true labels
+    :return: (n,) binary array of coverage and (n,) numpy array of lengths
+    """
     def is_covered(confint_list, y):
         for confint_2 in confint_list:
             if y >= confint_2[0] and y <= confint_2[1]:
@@ -35,32 +48,54 @@ def get_coverage_of_randomized_confidence_sets(C_n, y_n):
     len_n = np.array([get_len_conf_set(confset) for confset in C_n])
     return cov_n, len_n
 
-def get_randomized_confidence_set(scores_m, weights_m1, predtest, alpha: float = 0.1):
+def get_randomized_staircase_confidence_set(scores_m, weights_m1, predtest, alpha: float = 0.1):
+    """
+    Computes the "randomized staircase" confidence set in Alg. S1.
+
+    :param scores_m: (m,) numpy array of calibration scores
+    :param weights_m1: (m + 1) numpy array of calibration weights and single test weight
+    :param predtest: float, prediction on test input
+    :param alpha: miscoverage level
+    :return: list of tuples (l, u), where l and u are floats denoting lower and upper
+        endpoints of an interval.
+    """
     lb_is_set = False
     idx = np.argsort(scores_m)
     sortedscores_m1 = np.hstack([0, scores_m[idx]])
     sortedweights_m1 = np.hstack([0, weights_m1[: -1][idx]])
     C = []
-    for i in range(sortedscores_m1.size - 1):
-        tmp = np.sum(sortedweights_m1[: i + 1])
-        if tmp + weights_m1[-1] < 1 - alpha:
-            C.append([predtest + sortedscores_m1[i], predtest + sortedscores_m1[i + 1]])
-            C.append([predtest - sortedscores_m1[i + 1], predtest - sortedscores_m1[i]])
-        elif tmp + weights_m1[-1] >= 1 - alpha and tmp < 1 - alpha:
+
+    # interval that is deterministically included in the confidence set
+    # (color-coded green in Fig. S1)
+    cdf_m1 = np.cumsum(sortedweights_m1) # CDF up to i-th sorted calibration score
+    cdf_plus_test_weight_m1 = cdf_m1 + weights_m1[-1]
+    deterministic_idx = np.where(cdf_plus_test_weight_m1 < 1 - alpha)[0]
+    if deterministic_idx.size:
+        i_det = np.max(deterministic_idx)
+        C.append((predtest - sortedscores_m1[i_det + 1], predtest + sortedscores_m1[i_det + 1]))
+
+    # intervals that are randomly included in the confidence set
+    # (color-coded teal and blue in Fig. S1)
+    for i in range(i_det + 1, sortedscores_m1.size - 1):
+        assert(cdf_plus_test_weight_m1[i] >= 1 - alpha)
+        if cdf_plus_test_weight_m1[i] >= 1 - alpha and cdf_m1[i] < 1 - alpha:
             if not lb_is_set:
                 lb_is_set = True
-                LF = tmp
-            F = (tmp + weights_m1[-1] - (1 - alpha)) / (tmp + weights_m1[-1] - LF)
+                LF = cdf_m1[i]
+            F = (cdf_plus_test_weight_m1[i] - (1 - alpha)) / (cdf_m1[i] + weights_m1[-1] - LF)
             if sc.stats.bernoulli.rvs(1 - F):
-                C.append([predtest + sortedscores_m1[i], predtest + sortedscores_m1[i + 1]])
-                C.append([predtest - sortedscores_m1[i + 1], predtest - sortedscores_m1[i]])
-    if np.sum(weights_m1[: -1]) < 1 - alpha:
+                C.append((predtest + sortedscores_m1[i], predtest + sortedscores_m1[i + 1]))
+                C.append((predtest - sortedscores_m1[i + 1], predtest - sortedscores_m1[i]))
+
+    # halfspaces that are randomly included in the confidence set
+    # (color-coded purple in Fig. S1)
+    if cdf_m1[-1] < 1 - alpha:  # sum of all calibration weights
         if not lb_is_set:
-            LF = np.sum(weights_m1[: -1])
+            LF = cdf_m1[-1]
         F = alpha / (1 - LF)
         if sc.stats.bernoulli.rvs(1 - F):
-            C.append([predtest + sortedscores_m1[-1], np.inf])
-            C.append([-np.inf, predtest - sortedscores_m1[-1]])
+            C.append((predtest + sortedscores_m1[-1], np.inf))
+            C.append((-np.inf, predtest - sortedscores_m1[-1]))
     return C
 
 
