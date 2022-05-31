@@ -57,7 +57,7 @@ def pnuc2paa(pnuc_Lxk):
             # for each codon corresponding to the AA, compute probability of generating that codon
             for cod in codons:
                 p_cod = 1
-                for j in range(3): # multiply probabilities of each of the 3 nucleotides in the codon
+                for j in range(3):  # multiply probabilities of each of the 3 nucleotides in the codon
                     nuc_idx = NUC2IDX[cod[j].upper()]
                     p_cod *= pnuc_Lxk[i * 3 + j, nuc_idx]
                 paadf_kxL[i].loc[aa] += p_cod
@@ -73,7 +73,7 @@ def phinuc2paa(phinuc_Lxk):
     paa_Lxk = np.array(pnuc2paa(pnuc_Lxk))
     return paa_Lxk
 
-# NNK categorical distribution
+# NNK (training) distribution
 pnnknucpersite = np.array([[0.25, 0.25, 0.25, 0.25], [0.25, 0.25, 0.25, 0.25], [0, 0.5, 0, 0.5]])
 pnnknuc_Lxk = np.tile(pnnknucpersite, [7, 1])
 PNNKAA_LXK = np.array(pnuc2paa(pnnknuc_Lxk))
@@ -258,7 +258,7 @@ class PoelwijkData(Assay):
         # ===== estimate per-sequence measurement noise SD =====
 
         if load_precomputed_noise:
-            d = np.load('../data/fluorescence/{}_noise.npz'.format(fitness))
+            d = np.load('../fluorescence/{}_noise.npz'.format(fitness))
             self.se_n = d['se_n']
             print("Loading estimated measurement noise SD computed using order {} and significance level {}".format(
                 d['order_est_noise'], d['sig_level']))
@@ -301,7 +301,7 @@ class PoelwijkData(Assay):
             # predictions made using the statistically significant coefficients
             pred_n = X_nxp[:, sigterm_idx].dot(ols.coef_[sigterm_idx])
             self.se_n = np.abs(pred_n - self.y_n)
-            np.savez('../data/fluorescence/{}_noise.npz'.format(fitness),
+            np.savez('../fluorescence/{}_noise.npz'.format(fitness),
                      se_n=self.se_n, noise_estimate_order=noise_estimate_order, pvals=pvals, threshold=threshold,
                      sigterm_idx=sigterm_idx, n_feat=n_feat, sig_level=sig_level)
 
@@ -314,7 +314,7 @@ class PoelwijkData(Assay):
 
         :return: pandas dataframe
         """
-        df = pd.read_excel("../data/fluorescence/supp_data_3.xlsx", skiprows=2, header=None)
+        df = pd.read_excel("../fluorescence/supp_data_3.xlsx", skiprows=2, header=None)
         df.columns = ["binary_genotype", "amino_acid_sequence", "counts_input", "counts_red", "counts_blue",
                             "UNK1", "brightness_red", "brightness_blue", "UNK2", "brightness_combined"]
         df["binary_genotype"] = df["binary_genotype"].apply(lambda x: x[1:-1])
