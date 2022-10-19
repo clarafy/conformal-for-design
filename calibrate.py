@@ -1,6 +1,7 @@
 """
-Classes for full conformal prediction for exchangeable data and data under standard and feedback covariate shift,
-both for black-box predictive models and computationally optimized for ridge regression.
+Classes for full conformal prediction for exchangeable, standard, and feedback covariate shift data,
+both for black-box predictive models and computationally optimized for ridge regression, and
+functions for (random, exact-coverage) split conformal prediction under standard covariate shift.
 Throughout this file, variable name suffixes denote the shape of the numpy array, where
     n: number of training points, or generic number of data points
     n1: n + 1
