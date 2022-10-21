@@ -1,4 +1,4 @@
-name: conformal-proteins 
+name: conformal-design 
 channels:
   - pytorch
   - anaconda
