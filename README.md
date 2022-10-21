@@ -2,7 +2,7 @@
 This repo contains the code accompanying the following paper:
 
 C. Fannjiang, S. Bates, A. Angelopoulos, J. Listgarten, M. I. Jordan, Conformal prediction under feedback covariate shift for biomolecular design. 2022. *Proceedings of the National Academy of Sciences*, 119(43), e2204569119.
-[publication](https://www.pnas.org/doi/10.1073/pnas.2204569119)
+[link](https://www.pnas.org/doi/10.1073/pnas.2204569119)
 
 See `calibrate.py` for implementations of both the full and split conformal prediction algorithms we describe. `assay.py` contains utilities and classes for handling the fluorescence and AAV datasets, which are stored (along with relevant models and results) in `fluorescence/` and `aav/`, respectively.
 
